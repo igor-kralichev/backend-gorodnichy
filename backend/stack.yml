@@ -1,0 +1,120 @@
+name: municipal-low-code-backend
+
+services:
+  redis:
+    image: redis:8.2-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      platform:
+        aliases:
+          - redis
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: municipal-low-code-api:latest
+    command: ["alembic", "upgrade", "head"]
+    environment: &api-environment
+      APP_ENV: ${APP_ENV:-local}
+      APP_NAME: ${APP_NAME:-API муниципальной low-code платформы}
+      API_V1_PREFIX: ${API_V1_PREFIX:-/api/v1}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://lowcode:lowcode@postgres:5432/lowcode}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_SCHEMA_TTL_SECONDS: ${REDIS_SCHEMA_TTL_SECONDS:-3600}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://lowcode:lowcode@rabbitmq:5672/}
+      IMPORT_QUEUE_NAME: ${IMPORT_QUEUE_NAME:-object-imports}
+      IMPORT_ASYNC_THRESHOLD: ${IMPORT_ASYNC_THRESHOLD:-1000}
+      IMPORT_BATCH_SIZE: ${IMPORT_BATCH_SIZE:-500}
+      IMPORT_TEMP_PREFIX: ${IMPORT_TEMP_PREFIX:-imports}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ADMIN_ROLE_NAME: ${ADMIN_ROLE_NAME:-Admin}
+      DEFAULT_USER_ROLE_NAME: ${DEFAULT_USER_ROLE_NAME:-User}
+      KEYCLOAK_PUBLIC_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}
+      KEYCLOAK_INTERNAL_URL: ${KEYCLOAK_INTERNAL_URL:-http://keycloak:8080}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-municipal-low-code}
+      KEYCLOAK_API_CLIENT_ID: ${KEYCLOAK_API_CLIENT_ID:-municipal-api}
+      KEYCLOAK_API_CLIENT_SECRET: ${KEYCLOAK_API_CLIENT_SECRET:-municipal-api-secret}
+      KEYCLOAK_SWAGGER_CLIENT_ID: ${KEYCLOAK_SWAGGER_CLIENT_ID:-municipal-spa}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-localhost:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-lowcode}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-lowcode-secret}
+      MINIO_BUCKET: ${MINIO_BUCKET:-municipal-attachments}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      MAX_ATTACHMENT_SIZE_BYTES: ${MAX_ATTACHMENT_SIZE_BYTES:-52428800}
+      DADATA_API_KEY: ${DADATA_API_KEY:-}
+      DADATA_SECRET_KEY: ${DADATA_SECRET_KEY:-}
+      DADATA_SUGGESTIONS_URL: ${DADATA_SUGGESTIONS_URL:-https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/address}
+      NOMINATIM_URL: ${NOMINATIM_URL:-http://nominatim:8080}
+      NOMINATIM_PUBLIC_URL: ${NOMINATIM_PUBLIC_URL:-http://localhost:8081}
+      GEOCODING_DEFAULT_LIMIT: ${GEOCODING_DEFAULT_LIMIT:-10}
+    restart: "no"
+    networks: [platform]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: municipal-low-code-api:latest
+    environment: *api-environment
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      platform:
+        aliases:
+          - api
+
+  import-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: municipal-low-code-api:latest
+    command: ["python", "-m", "app.workers.import_worker"]
+    environment: *api-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      platform:
+        aliases:
+          - import-worker
+
+volumes:
+  redis_data:
+    name: municipal_low_code_redis_data
+
+networks:
+  platform:
+    name: municipal_low_code_network
+    external: true

@@ -1,0 +1,16 @@
+alembic==1.16.5
+asyncpg==0.30.0
+email-validator==2.3.0
+fastapi==0.141.1
+geoalchemy2==0.18.0
+httpx==0.28.1
+aio-pika==9.5.7
+minio==7.2.12
+orjson==3.11.3
+pydantic-settings==2.10.1
+PyJWT[crypto]==2.10.1
+python-multipart==0.0.20
+python-slugify==8.0.4
+redis==6.4.0
+sqlalchemy[asyncio]==2.0.43
+uvicorn[standard]==0.52.4

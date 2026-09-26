@@ -1,0 +1,57 @@
+name: municipal-low-code-postgres
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: municipal-low-code-postgis:17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-lowcode}
+      POSTGRES_USER: ${POSTGRES_USER:-lowcode}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lowcode}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lowcode} -d ${POSTGRES_DB:-lowcode}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      platform:
+        aliases:
+          - postgres
+
+  pgadmin:
+    profiles: ["tools"]
+    image: dpage/pgadmin4:9
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@local.dev}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [platform]
+
+volumes:
+  postgres_data:
+    name: municipal_low_code_postgres_data
+  pgadmin_data:
+    name: municipal_low_code_pgadmin_data
+
+networks:
+  platform:
+    name: municipal_low_code_network
+    driver: bridge

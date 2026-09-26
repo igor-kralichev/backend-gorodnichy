@@ -1,0 +1,13 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Municipal Low-code PostgreSQL",
+      "Group": "Local Docker",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "lowcode",
+      "Username": "lowcode",
+      "SSLMode": "prefer"
+    }
+  }
+}

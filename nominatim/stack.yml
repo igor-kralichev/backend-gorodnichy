@@ -1,0 +1,38 @@
+name: municipal-low-code-nominatim
+
+services:
+  nominatim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: municipal-low-code-nominatim:latest
+    shm_size: 1g
+    environment:
+      PBF_URL: ${NOMINATIM_PBF_URL:-https://download.geofabrik.de/russia/volga-fed-district-latest.osm.pbf}
+      REPLICATION_URL: ${NOMINATIM_REPLICATION_URL:-}
+      UPDATE_MODE: ${NOMINATIM_UPDATE_MODE:-none}
+      FREEZE: ${NOMINATIM_FREEZE:-true}
+      IMPORT_WIKIPEDIA: ${NOMINATIM_IMPORT_WIKIPEDIA:-false}
+      NOMINATIM_PASSWORD: ${NOMINATIM_PASSWORD:-nominatim}
+      THREADS: ${NOMINATIM_THREADS:-4}
+    ports:
+      - "${NOMINATIM_PORT:-8081}:8080"
+    volumes:
+      - nominatim_data:/var/lib/postgresql/16/main
+      - nominatim_flatnode:/nominatim/flatnode
+    restart: unless-stopped
+    networks:
+      platform:
+        aliases:
+          - nominatim
+
+volumes:
+  nominatim_data:
+    name: municipal_low_code_nominatim_data
+  nominatim_flatnode:
+    name: municipal_low_code_nominatim_flatnode
+
+networks:
+  platform:
+    name: municipal_low_code_network
+    external: true

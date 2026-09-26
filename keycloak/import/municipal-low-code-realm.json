@@ -1,0 +1,73 @@
+{
+  "realm": "municipal-low-code",
+  "displayName": "Муниципальная low-code платформа",
+  "enabled": true,
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "roles": {
+    "realm": [
+      {
+        "name": "Admin",
+        "description": "Администратор платформы"
+      },
+      {
+        "name": "User",
+        "description": "Пользователь платформы"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "municipal-api",
+      "name": "Backend API муниципальной платформы",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "municipal-api-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "bearerOnly": false
+    },
+    {
+      "clientId": "municipal-spa",
+      "name": "Swagger и SPA муниципальной платформы",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": [
+        "http://localhost:8000/docs/oauth2-redirect",
+        "http://localhost:5173/*"
+      ],
+      "webOrigins": [
+        "http://localhost:8000",
+        "http://localhost:5173"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      }
+    }
+  ],
+  "users": [
+    {
+      "username": "service-account-municipal-api",
+      "enabled": true,
+      "serviceAccountClientId": "municipal-api",
+      "realmRoles": [
+        "Admin"
+      ],
+      "clientRoles": {
+        "realm-management": [
+          "manage-users",
+          "view-users",
+          "query-users",
+          "view-realm"
+        ]
+      }
+    }
+  ]
+}

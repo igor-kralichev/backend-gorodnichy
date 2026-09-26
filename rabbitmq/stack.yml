@@ -1,0 +1,36 @@
+name: municipal-low-code-rabbitmq
+
+services:
+  rabbitmq:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: municipal-low-code-rabbitmq:latest
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-lowcode}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-lowcode}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_DEFAULT_VHOST:-/}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks:
+      platform:
+        aliases:
+          - rabbitmq
+
+volumes:
+  rabbitmq_data:
+    name: municipal_low_code_rabbitmq_data
+
+networks:
+  platform:
+    name: municipal_low_code_network
+    external: true
