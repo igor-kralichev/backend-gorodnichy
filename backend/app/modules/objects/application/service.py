@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+import re
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from typing import cast as type_cast
 from uuid import UUID, uuid4
+from urllib.parse import urlparse
 
 from sqlalchemy import Date, DateTime, Numeric, String, and_, cast, delete, func, not_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.entities.domain.enums import FieldType
-from app.modules.entities.infrastructure.models import EntityFieldModel, EntitySchemaModel
+from app.modules.entities.infrastructure.models import (
+    EntityFieldModel,
+    EntitySchemaModel,
+    EntitySchemaVersionModel,
+)
 from app.modules.objects.api.schemas import (
     EntityObjectBulkCreateRead,
     EntityObjectCreate,
@@ -22,16 +28,21 @@ from app.modules.objects.api.schemas import (
     EntityObjectStatusRead,
     GeoJsonGeometry,
     ObjectFilter,
+    ObjectClusterPage,
+    ObjectClusterRead,
     ObjectSearch,
     ValidationIssue,
 )
+from app.modules.objects.application.calculations import evaluate_calculated_fields
 from app.shared.db.models import (
     AttachmentModel,
     DictionaryItemModel,
     EntityObjectModel,
+    EntityUniqueValueModel,
     ImportRowModel,
     ObjectSearchIndexModel,
     ObjectEventModel,
+    OrganizationModel,
     OutboxEventModel,
 )
 
@@ -70,6 +81,8 @@ class RuntimeObjectService:
         entity_code: str,
         payloads: list[EntityObjectCreate],
         actor_id: UUID | None,
+        *,
+        object_ids: list[UUID] | None = None,
     ) -> EntityObjectBulkCreateRead:
         if not payloads:
             raise RuntimeValidationError(
@@ -81,19 +94,29 @@ class RuntimeObjectService:
                     }
                 ]
             )
+        if object_ids is not None and len(object_ids) != len(payloads):
+            raise ValueError("Количество objectIds должно совпадать с количеством объектов")
         created: list[tuple[EntityObjectModel, EntitySchemaModel, GeoJsonGeometry | None]] = []
+        batch_unique_values: set[tuple[UUID, str]] = set()
         async with self._session.begin():
             schema = await self._get_schema(entity_code)
-            for payload in payloads:
+            schema_version_id = await self._schema_version_id(schema.id)
+            for index, payload in enumerate(payloads):
                 parent_object_id = await self._resolve_parent_object_id(schema, payload.parent_object_id)
+                owner_organization_id = payload.owner_organization_id or schema.owner_organization_id
+                await self._validate_organization(owner_organization_id)
                 values = await self._normalize_values(schema, dict(payload.values))
                 issues = await self._validate(schema, values, payload.geometry)
-                object_id = uuid4()
+                issues.extend(await self._unique_issues(schema, values, batch_unique_values=batch_unique_values))
+                object_id = object_ids[index] if object_ids is not None else uuid4()
                 model = EntityObjectModel(
                     id=object_id,
                     entity_schema_id=schema.id,
+                    schema_version_id=schema_version_id,
                     parent_object_id=parent_object_id,
                     municipality_id=schema.scope_municipality_id,
+                    owner_organization_id=owner_organization_id,
+                    responsible_id=payload.responsible_id,
                     values=values,
                     geometry=self._geometry_expression(payload.geometry),
                     attachment_paths=[],
@@ -127,6 +150,7 @@ class RuntimeObjectService:
             await self._session.flush()
             for model, schema, _ in created:
                 await self._sync_search_index(model, schema, model.values)
+                await self._sync_unique_values(model, schema, model.values)
         data = [
             await self._to_response(model, schema, geometry)
             for model, schema, geometry in created
@@ -143,6 +167,36 @@ class RuntimeObjectService:
         model, geometry = await self._get_object(schema.id, object_id)
         return await self._to_response(model, schema, geometry)
 
+    async def copy(
+        self,
+        entity_code: str,
+        object_id: UUID,
+        actor_id: UUID | None,
+    ) -> EntityObjectRead:
+        """Создать копию объекта без уникальных и вычисляемых значений."""
+
+        schema = await self._get_schema(entity_code)
+        source, geometry = await self._get_object(schema.id, object_id)
+        excluded_codes = {
+            field.code
+            for field in schema.fields
+            if field.unique_value or field.read_only or field.archived
+        }
+        values = {
+            code: value
+            for code, value in source.values.items()
+            if code not in excluded_codes
+        }
+        payload = EntityObjectCreate(
+            values=values,
+            parent_object_id=source.parent_object_id,
+            owner_organization_id=source.owner_organization_id,
+            responsible_id=source.responsible_id,
+            geometry=geometry,
+        )
+        await self._session.rollback()
+        return await self.create(entity_code, payload, actor_id)
+
     async def list_page(
         self,
         entity_code: str,
@@ -152,6 +206,14 @@ class RuntimeObjectService:
         conditions = [EntityObjectModel.entity_schema_id == schema.id, EntityObjectModel.status != "archived"]
         if search.parent_object_id is not None:
             conditions.append(EntityObjectModel.parent_object_id == search.parent_object_id)
+        if search.bbox is not None:
+            min_lon, min_lat, max_lon, max_lat = search.bbox
+            conditions.append(
+                func.ST_Intersects(
+                    EntityObjectModel.geometry,
+                    func.ST_MakeEnvelope(min_lon, min_lat, max_lon, max_lat, 4326),
+                )
+            )
         filter_conditions = [await self._filter_condition(schema, item) for item in search.filters]
         if filter_conditions:
             conditions.append(or_(*filter_conditions) if search.logic == "or" else and_(*filter_conditions))
@@ -174,6 +236,44 @@ class RuntimeObjectService:
         ]
         return EntityObjectPage(total=total, returned=len(data), offset=search.offset, limit=search.limit, data=data)
 
+    async def list_clusters(
+        self,
+        entity_code: str,
+        bbox: tuple[float, float, float, float],
+        zoom: int,
+    ) -> ObjectClusterPage:
+        schema = await self._get_schema(entity_code)
+        min_lon, min_lat, max_lon, max_lat = bbox
+        envelope = func.ST_MakeEnvelope(min_lon, min_lat, max_lon, max_lat, 4326)
+        point = func.ST_PointOnSurface(EntityObjectModel.geometry)
+        grid_size = 360.0 / ((2**zoom) * 64)
+        snapped = func.ST_SnapToGrid(point, grid_size)
+        conditions = [
+            EntityObjectModel.entity_schema_id == schema.id,
+            EntityObjectModel.status == "published",
+            EntityObjectModel.geometry.is_not(None),
+            func.ST_Intersects(EntityObjectModel.geometry, envelope),
+        ]
+        rows = (
+            await self._session.execute(
+                select(
+                    func.ST_X(snapped).label("longitude"),
+                    func.ST_Y(snapped).label("latitude"),
+                    func.count().label("count"),
+                )
+                .where(*conditions)
+                .group_by(snapped)
+                .order_by(func.count().desc())
+            )
+        ).all()
+        return ObjectClusterPage(
+            clusters=[
+                ObjectClusterRead(longitude=float(lon), latitude=float(lat), count=int(count))
+                for lon, lat, count in rows
+            ],
+            total_objects=sum(int(count) for _, _, count in rows),
+        )
+
     async def update(
         self,
         entity_code: str,
@@ -194,10 +294,17 @@ class RuntimeObjectService:
             geometry_changed = "geometry" in payload.model_fields_set
             next_geometry = payload.geometry if geometry_changed else current_geometry
             issues = await self._validate(schema, values, next_geometry)
+            issues.extend(await self._unique_issues(schema, values, exclude_object_id=model.id))
 
             model.values = values
+            if "owner_organization_id" in payload.model_fields_set:
+                await self._validate_organization(payload.owner_organization_id)
+                model.owner_organization_id = payload.owner_organization_id
+            if "responsible_id" in payload.model_fields_set:
+                model.responsible_id = payload.responsible_id
             if geometry_changed:
                 model.geometry = self._geometry_expression(payload.geometry)
+            model.schema_version_id = await self._schema_version_id(schema.id)
             model.status = "published" if not issues else "draft"
             model.data_quality = "complete" if not issues else "incomplete"
             model.validation_errors = issues
@@ -219,6 +326,7 @@ class RuntimeObjectService:
             self._add_outbox("entity_object.updated.v1", model, schema.code, actor_id)
             await self._session.flush()
             await self._sync_search_index(model, schema, values)
+            await self._sync_unique_values(model, schema, values)
             await self._session.refresh(model, attribute_names=["updated_at"])
         return await self._to_response(model, schema, next_geometry)
 
@@ -228,6 +336,7 @@ class RuntimeObjectService:
             model, _ = await self._get_object(schema.id, object_id, for_update=True)
             if model.status != "archived":
                 model.status = "archived"
+                model.archived_at = datetime.now(UTC)
                 model.revision += 1
                 model.updated_by = actor_id
                 self._session.add(
@@ -267,6 +376,7 @@ class RuntimeObjectService:
             issues = await self._validate(schema, values, geometry)
             model.values = values
             model.status = "published" if not issues else "draft"
+            model.archived_at = None
             model.data_quality = "complete" if not issues else "incomplete"
             model.validation_errors = issues
             model.revision += 1
@@ -287,6 +397,7 @@ class RuntimeObjectService:
             self._add_outbox("entity_object.restored.v1", model, schema.code, actor_id)
             await self._session.flush()
             await self._sync_search_index(model, schema, values)
+            await self._sync_unique_values(model, schema, values)
         return EntityObjectStatusRead(
             id=model.id,
             status=model.status,
@@ -360,6 +471,45 @@ class RuntimeObjectService:
             raise RuntimeEntityNotFound
         return schema
 
+    async def _schema_version_id(self, entity_id: UUID) -> UUID:
+        version_id = await self._session.scalar(
+            select(EntitySchemaVersionModel.id)
+            .where(EntitySchemaVersionModel.entity_schema_id == entity_id)
+            .order_by(EntitySchemaVersionModel.version.desc())
+            .limit(1)
+        )
+        if version_id is None:
+            raise RuntimeValidationError(
+                [
+                    {
+                        "fieldCode": None,
+                        "code": "schema_version_missing",
+                        "message": "У опубликованной сущности отсутствует версия схемы",
+                    }
+                ]
+            )
+        return version_id
+
+    async def _validate_organization(self, organization_id: UUID | None) -> None:
+        if organization_id is None:
+            return
+        exists = await self._session.scalar(
+            select(OrganizationModel.id).where(
+                OrganizationModel.id == organization_id,
+                OrganizationModel.active.is_(True),
+            )
+        )
+        if exists is None:
+            raise RuntimeValidationError(
+                [
+                    {
+                        "fieldCode": None,
+                        "code": "organization_not_found",
+                        "message": "Организация-владелец не найдена или неактивна",
+                    }
+                ]
+            )
+
     async def _get_object(
         self,
         entity_id: UUID,
@@ -385,6 +535,9 @@ class RuntimeObjectService:
     ) -> dict[str, Any]:
         normalized = dict(values)
         fields = {field.code: field for field in schema.fields}
+        for field in schema.fields:
+            if field.code not in normalized and field.default_value is not None and not field.read_only:
+                normalized[field.code] = field.default_value
         for field_code, value in values.items():
             field = fields.get(field_code)
             if field is None:
@@ -392,12 +545,21 @@ class RuntimeObjectService:
             if isinstance(value, str):
                 normalized[field_code] = value.strip()
                 value = normalized[field_code]
+            if field.field_type == FieldType.DECIMAL.value and not self._empty(value):
+                try:
+                    decimal_value = Decimal(str(value))
+                    if not decimal_value.is_finite():
+                        raise InvalidOperation
+                    normalized[field_code] = format(decimal_value, "f")
+                    value = normalized[field_code]
+                except InvalidOperation:
+                    pass
             if field.field_type != FieldType.ENUM.value or self._empty(value):
                 continue
             enum_value = await self._normalize_enum_value(field, value)
             if enum_value is not None:
                 normalized[field_code] = enum_value
-        return normalized
+        return evaluate_calculated_fields(schema.fields, normalized)
 
     async def _sync_search_index(
         self,
@@ -447,6 +609,84 @@ class RuntimeObjectService:
                     )
                 )
         self._session.add_all(index_rows)
+
+    async def _sync_unique_values(
+        self,
+        model: EntityObjectModel,
+        schema: EntitySchemaModel,
+        values: dict[str, Any],
+    ) -> None:
+        await self._session.execute(
+            delete(EntityUniqueValueModel).where(EntityUniqueValueModel.entity_object_id == model.id)
+        )
+        rows: list[EntityUniqueValueModel] = []
+        for field in schema.fields:
+            if not field.unique_value:
+                continue
+            value = values.get(field.code)
+            if self._empty(value):
+                continue
+            normalized = self._normalize_unique_value(value)
+            conflict = await self._session.scalar(
+                select(EntityUniqueValueModel.id).where(
+                    EntityUniqueValueModel.entity_field_id == field.id,
+                    EntityUniqueValueModel.normalized_value == normalized,
+                    EntityUniqueValueModel.entity_object_id != model.id,
+                )
+            )
+            if conflict is not None:
+                continue
+            rows.append(
+                EntityUniqueValueModel(
+                    entity_schema_id=schema.id,
+                    entity_field_id=field.id,
+                    entity_object_id=model.id,
+                    normalized_value=normalized,
+                )
+            )
+        self._session.add_all(rows)
+
+    async def _unique_issues(
+        self,
+        schema: EntitySchemaModel,
+        values: dict[str, Any],
+        *,
+        exclude_object_id: UUID | None = None,
+        batch_unique_values: set[tuple[UUID, str]] | None = None,
+    ) -> list[dict[str, str | None]]:
+        issues: list[dict[str, str | None]] = []
+        for field in schema.fields:
+            if not field.unique_value or self._empty(values.get(field.code)):
+                continue
+            normalized = self._normalize_unique_value(values[field.code])
+            key = (field.id, normalized)
+            in_batch = batch_unique_values is not None and key in batch_unique_values
+            conditions = [
+                EntityUniqueValueModel.entity_field_id == field.id,
+                EntityUniqueValueModel.normalized_value == normalized,
+            ]
+            if exclude_object_id is not None:
+                conditions.append(EntityUniqueValueModel.entity_object_id != exclude_object_id)
+            exists = await self._session.scalar(
+                select(EntityUniqueValueModel.id).where(*conditions).limit(1)
+            )
+            if in_batch or exists is not None:
+                issues.append(
+                    {
+                        "fieldCode": field.code,
+                        "code": "not_unique",
+                        "message": f"Значение поля «{field.name}» уже используется",
+                    }
+                )
+            elif batch_unique_values is not None:
+                batch_unique_values.add(key)
+        return issues
+
+    @staticmethod
+    def _normalize_unique_value(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip().casefold()
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     @staticmethod
     def _normalize_search_value(value: str) -> str:
@@ -517,6 +757,7 @@ class RuntimeObjectService:
                 continue
             if self._empty(value):
                 continue
+            issues.extend(self._validate_constraints(field, value))
             if field.field_type == FieldType.ENUM.value:
                 issues.extend(await self._validate_enum_value(field, value))
             elif field.field_type == FieldType.REFERENCE.value:
@@ -540,6 +781,84 @@ class RuntimeObjectService:
                         "fieldCode": None,
                         "code": "geometry_type",
                         "message": "Геометрия содержит запрещённые типы: " + ", ".join(disallowed),
+                    }
+                )
+        return issues
+
+    @staticmethod
+    def _validate_constraints(field: EntityFieldModel, value: Any) -> list[dict[str, str | None]]:
+        issues: list[dict[str, str | None]] = []
+        if isinstance(value, str):
+            if field.min_length is not None and len(value) < field.min_length:
+                issues.append(
+                    {
+                        "fieldCode": field.code,
+                        "code": "min_length",
+                        "message": f"Поле «{field.name}» должно содержать не менее {field.min_length} символов",
+                    }
+                )
+            if field.max_length is not None and len(value) > field.max_length:
+                issues.append(
+                    {
+                        "fieldCode": field.code,
+                        "code": "max_length",
+                        "message": f"Поле «{field.name}» должно содержать не более {field.max_length} символов",
+                    }
+                )
+            if field.field_type == FieldType.EMAIL.value and not re.fullmatch(
+                r"[^@\s]+@[^@\s]+\.[^@\s]+", value
+            ):
+                issues.append(
+                    {
+                        "fieldCode": field.code,
+                        "code": "invalid_email",
+                        "message": f"Поле «{field.name}» должно содержать корректный email",
+                    }
+                )
+            if field.field_type == FieldType.PHONE.value and not re.fullmatch(
+                r"\+?[0-9()\-\s]{7,32}", value
+            ):
+                issues.append(
+                    {
+                        "fieldCode": field.code,
+                        "code": "invalid_phone",
+                        "message": f"Поле «{field.name}» должно содержать корректный телефон",
+                    }
+                )
+            if field.field_type == FieldType.URL.value:
+                parsed = urlparse(value)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    issues.append(
+                        {
+                            "fieldCode": field.code,
+                            "code": "invalid_url",
+                            "message": f"Поле «{field.name}» должно содержать корректный URL",
+                        }
+                    )
+        if (
+            isinstance(value, int | float)
+            and not isinstance(value, bool)
+            or field.field_type == FieldType.DECIMAL.value
+            and isinstance(value, str)
+        ):
+            try:
+                decimal_value = Decimal(str(value))
+            except InvalidOperation:
+                return issues
+            if field.min_value is not None and decimal_value < Decimal(str(field.min_value)):
+                issues.append(
+                    {
+                        "fieldCode": field.code,
+                        "code": "min_value",
+                        "message": f"Значение поля «{field.name}» меньше допустимого",
+                    }
+                )
+            if field.max_value is not None and decimal_value > Decimal(str(field.max_value)):
+                issues.append(
+                    {
+                        "fieldCode": field.code,
+                        "code": "max_value",
+                        "message": f"Значение поля «{field.name}» больше допустимого",
                     }
                 )
         return issues
@@ -586,21 +905,22 @@ class RuntimeObjectService:
         if field.reference_entity_schema_id is None:
             valid = False
         else:
+            raw_values = value if field.multiple and isinstance(value, list) else [value]
             try:
-                reference_id = UUID(str(value))
+                reference_ids = [UUID(str(item)) for item in raw_values]
             except (TypeError, ValueError):
                 valid = False
             else:
-                valid = bool(
-                    await self._session.scalar(
+                found = set(
+                    await self._session.scalars(
                         select(EntityObjectModel.id).where(
-                            EntityObjectModel.id == reference_id,
-                            EntityObjectModel.entity_schema_id
-                            == field.reference_entity_schema_id,
+                            EntityObjectModel.id.in_(reference_ids),
+                            EntityObjectModel.entity_schema_id == field.reference_entity_schema_id,
                             EntityObjectModel.status != "archived",
                         )
                     )
                 )
+                valid = len(found) == len(set(reference_ids))
         if valid:
             return []
         return [
@@ -618,7 +938,9 @@ class RuntimeObjectService:
             FieldType.STRING,
             FieldType.TEXT,
             FieldType.ADDRESS,
-            FieldType.FILE,
+            FieldType.PHONE,
+            FieldType.EMAIL,
+            FieldType.URL,
         ):
             return isinstance(value, str)
         if field_type == FieldType.ENUM:
@@ -626,16 +948,25 @@ class RuntimeObjectService:
                 isinstance(value, list)
                 and all(isinstance(item, str) for item in value)
             )
+        if field_type == FieldType.FILE:
+            return isinstance(value, str) or (
+                field.multiple and isinstance(value, list) and all(isinstance(item, str) for item in value)
+            )
         if field_type == FieldType.INTEGER:
             return isinstance(value, int) and not isinstance(value, bool)
         if field_type == FieldType.DECIMAL:
-            return isinstance(value, int | float) and not isinstance(value, bool)
+            if isinstance(value, bool) or not isinstance(value, str | int | float):
+                return False
+            try:
+                return Decimal(str(value)).is_finite()
+            except InvalidOperation:
+                return False
         if field_type == FieldType.BOOLEAN:
             return isinstance(value, bool)
         if field_type == FieldType.REFERENCE:
+            values = value if field.multiple and isinstance(value, list) else [value]
             try:
-                UUID(str(value))
-                return True
+                return all(bool(UUID(str(item))) for item in values)
             except (TypeError, ValueError):
                 return False
         if field_type == FieldType.DATE:
@@ -650,6 +981,8 @@ class RuntimeObjectService:
                 return True
             except (TypeError, ValueError):
                 return False
+        if field_type == FieldType.CALCULATED:
+            return isinstance(value, str | int | float | bool)
         return False
 
     @staticmethod
@@ -674,7 +1007,16 @@ class RuntimeObjectService:
             for child in geometry.geometries or []:
                 result.extend(cls._geometry_types(child))
             return result
-        return [{"Point": "point", "LineString": "lineString", "Polygon": "polygon"}[geometry.type]]
+        return [
+            {
+                "Point": "point",
+                "MultiPoint": "point",
+                "LineString": "lineString",
+                "MultiLineString": "lineString",
+                "Polygon": "polygon",
+                "MultiPolygon": "polygon",
+            }[geometry.type]
+        ]
 
     async def _filter_condition(self, schema: EntitySchemaModel, item: ObjectFilter) -> Any:
         system_fields = {
@@ -1015,6 +1357,9 @@ class RuntimeObjectService:
             entity_id=model.entity_schema_id,
             entity_code=schema.code,
             parent_object_id=model.parent_object_id,
+            schema_version_id=model.schema_version_id,
+            owner_organization_id=model.owner_organization_id,
+            responsible_id=model.responsible_id,
             values=model.values,
             display_values=await self._display_values(schema, model.values),
             geometry=geometry,
@@ -1027,4 +1372,5 @@ class RuntimeObjectService:
             updated_at=model.updated_at,
             created_by=model.created_by,
             updated_by=model.updated_by,
+            archived_at=model.archived_at,
         )

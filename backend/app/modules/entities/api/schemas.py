@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -11,6 +11,7 @@ from app.modules.entities.domain.enums import (
     MapGeometryType,
     MapRuleOperator,
 )
+from app.modules.objects.application.calculations import CalculationError, formula_dependencies
 
 
 def to_camel(value: str) -> str:
@@ -111,6 +112,10 @@ class MapSettingsCreate(ApiModel):
 class EntityFieldCreate(ApiModel):
     """Описание одного пользовательского поля сущности."""
 
+    id: UUID | None = Field(
+        default=None,
+        description="Стабильный UUID поля; при создании можно не передавать",
+    )
     code: str | None = Field(
         default=None,
         min_length=1,
@@ -131,6 +136,25 @@ class EntityFieldCreate(ApiModel):
     card_visible: bool = Field(default=True, description="Показывать поле в карточке")
     searchable: bool = Field(default=True, description="Участвует ли поле в поиске")
     filterable: bool = Field(default=True, description="Доступно ли поле для фильтрации")
+    hint: str | None = Field(default=None, max_length=2000, description="Подсказка пользователю")
+    default_value: Any | None = Field(default=None, description="Значение по умолчанию")
+    group: str | None = Field(default=None, max_length=255, description="Группа поля в карточке и форме")
+    min_length: int | None = Field(default=None, ge=0, description="Минимальная длина строки")
+    max_length: int | None = Field(default=None, ge=0, description="Максимальная длина строки")
+    min_value: float | None = Field(default=None, description="Минимальное числовое значение")
+    max_value: float | None = Field(default=None, description="Максимальное числовое значение")
+    unique: bool = Field(default=False, description="Уникально ли значение в пределах сущности")
+    multiple: bool = Field(default=False, description="Разрешить несколько значений")
+    read_only: bool = Field(default=False, description="Запретить ручное изменение значения")
+    archived: bool = Field(default=False, description="Поле сохранено в схеме, но больше не используется для ввода")
+    access: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Разрешённые действия над полем по ролям",
+    )
+    formula: dict[str, Any] | None = Field(
+        default=None,
+        description="Проверяемое дерево выражения вычисляемого поля",
+    )
     enum_id: UUID | None = Field(
         default=None,
         description="UUID справочника; только для типа enum",
@@ -160,6 +184,18 @@ class EntityFieldCreate(ApiModel):
             raise ValueError("enumId разрешён только для поля типа enum")
         if self.type != FieldType.REFERENCE and self.reference_entity_id is not None:
             raise ValueError("referenceEntityId разрешён только для поля типа reference")
+        if self.min_length is not None and self.max_length is not None and self.min_length > self.max_length:
+            raise ValueError("minLength не может быть больше maxLength")
+        if self.min_value is not None and self.max_value is not None and self.min_value > self.max_value:
+            raise ValueError("minValue не может быть больше maxValue")
+        if self.multiple and self.type not in {FieldType.ENUM, FieldType.REFERENCE, FieldType.FILE}:
+            raise ValueError("multiple разрешён только для enum, reference и file")
+        if self.type == FieldType.CALCULATED:
+            if self.formula is None:
+                raise ValueError("Для calculated необходимо передать formula")
+            self.read_only = True
+        elif self.formula is not None:
+            raise ValueError("formula разрешена только для поля calculated")
         return self
 
 
@@ -253,6 +289,10 @@ class EntityCreate(ApiModel):
             "можно не передавать"
         ),
     )
+    owner_organization_id: UUID | None = Field(
+        default=None,
+        description="UUID организации-владельца реестра",
+    )
 
     @field_validator("name")
     @classmethod
@@ -269,6 +309,7 @@ class EntityCreate(ApiModel):
             raise ValueError("Коды полей должны быть уникальными")
         if sum(field.type == FieldType.ADDRESS for field in self.fields) > 1:
             raise ValueError("Разрешено только одно поле адреса")
+        _validate_formula_graph(self.fields)
         enabled_geometry_types = (
             self.map_settings.enabled_geometry_types if self.map_settings else []
         )
@@ -332,6 +373,10 @@ class EntityUpdate(ApiModel):
         default=None,
         description="Новый муниципалитет; null убирает ограничение",
     )
+    owner_organization_id: UUID | None = Field(
+        default=None,
+        description="Новая организация-владелец; null очищает владельца",
+    )
 
     @field_validator("name")
     @classmethod
@@ -353,7 +398,46 @@ class EntityUpdate(ApiModel):
                 raise ValueError("Коды полей должны быть уникальными")
             if sum(field.type == FieldType.ADDRESS for field in self.fields) > 1:
                 raise ValueError("Разрешено только одно поле адреса")
+            _validate_formula_graph(self.fields)
         return self
+
+
+def _validate_formula_graph(fields: list[EntityFieldCreate]) -> None:
+    by_code = {field.code: field for field in fields if field.code}
+    graph: dict[str, set[str]] = {}
+    for field in fields:
+        if field.type != FieldType.CALCULATED:
+            continue
+        if not field.code:
+            raise ValueError("Для вычисляемого поля необходимо явно указать code")
+        try:
+            dependencies = formula_dependencies(field.formula)
+        except CalculationError as error:
+            raise ValueError(f"Некорректная формула поля «{field.name}»: {error}") from error
+        unknown = dependencies - set(by_code)
+        if unknown:
+            raise ValueError(
+                f"Формула поля «{field.name}» ссылается на неизвестные поля: "
+                + ", ".join(sorted(unknown))
+            )
+        graph[field.code] = {code for code in dependencies if code in graph or by_code[code].type == FieldType.CALCULATED}
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(code: str) -> None:
+        if code in visiting:
+            raise ValueError("В формулах обнаружена циклическая зависимость")
+        if code in visited:
+            return
+        visiting.add(code)
+        for dependency in graph.get(code, set()):
+            visit(dependency)
+        visiting.remove(code)
+        visited.add(code)
+
+    for code in graph:
+        visit(code)
 
 
 class EntityDuplicateCreate(ApiModel):
@@ -399,6 +483,19 @@ class EntityFieldRead(ApiModel):
     order: int
     enum_id: UUID | None = None
     reference_entity_id: UUID | None = None
+    hint: str | None = None
+    default_value: Any | None = None
+    group: str | None = None
+    min_length: int | None = None
+    max_length: int | None = None
+    min_value: float | None = None
+    max_value: float | None = None
+    unique: bool = False
+    multiple: bool = False
+    read_only: bool = False
+    archived: bool = False
+    access: dict[str, list[str]] = Field(default_factory=dict)
+    formula: dict[str, Any] | None = None
 
 
 class MapColorRuleRead(MapColorRuleCreate):
@@ -432,6 +529,7 @@ class EntityRead(ApiModel):
     status: EntityStatus
     version: int
     scope_municipality_id: UUID | None
+    owner_organization_id: UUID | None
     created_at: datetime
     updated_at: datetime
 

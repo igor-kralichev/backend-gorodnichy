@@ -2,15 +2,16 @@
 
 Локальный геокодер для муниципальной платформы.
 
+Он используется backend как один из провайдеров `GET /api/v1/geocoding/addressSuggestions`; frontend не должен обращаться к контейнеру напрямую в production.
+
 ## Запуск
 
 ```bash
 docker compose -f nominatim/stack.yml up -d --build
 ```
 
-Первый запуск скачивает OSM PBF и строит поисковую базу. Это длительная операция:
-для MVP используется extract Приволжского федерального округа, потому что у Geofabrik
-нет отдельного стандартного extract только для Нижегородской области.
+Первый запуск скачивает OSM PBF и строит поисковую базу. Это длительная операция.
+Для MVP используется отдельный extract Нижегородской области от OSMlab.
 
 После импорта API будет доступен:
 
@@ -22,12 +23,12 @@ docker compose -f nominatim/stack.yml up -d --build
 По умолчанию используется:
 
 ```text
-https://download.geofabrik.de/russia/volga-fed-district-latest.osm.pbf
+https://www.osmlab.ru/regions/RU-NIZ.pbf
 ```
 
-Если позже нужен строго областной extract, подготовьте `.osm.pbf` через `osmium`
-по polygon/geojson границе Нижегородской области и передайте `NOMINATIM_PBF_URL`
-или замените stack на `PBF_PATH`.
+Источник можно переопределить переменной `NOMINATIM_PBF_URL`. Для полностью
+контролируемой поставки подготовьте собственный `.osm.pbf` через `osmium` по
+polygon/geojson-границе региона и используйте внутреннее файловое хранилище.
 
 ## Постоянное хранение
 
@@ -37,3 +38,5 @@ https://download.geofabrik.de/russia/volga-fed-district-latest.osm.pbf
 - `municipal_low_code_nominatim_flatnode`
 
 Поэтому пересборка контейнера не удаляет импортированную базу.
+
+Для удаления данных потребуется явное удаление volumes. Обычный `down` без `-v` безопасен. Первый импорт может занимать значительное время; готовность API следует проверять по логам контейнера, а не только по факту его запуска.

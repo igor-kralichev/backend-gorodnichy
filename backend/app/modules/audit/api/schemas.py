@@ -11,7 +11,26 @@ class ApiModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
 
 
-AuditResourceType = Literal["entity_schema", "entity_object", "dictionary", "user", "attachment", "import_job"]
+AuditResourceType = Literal[
+    "entity_schema",
+    "entity_object",
+    "dictionary",
+    "user",
+    "attachment",
+    "import_job",
+    "organization",
+    "membership",
+    "permission_grant",
+    "relation",
+    "change_set",
+    "form",
+    "information_request",
+    "form_submission",
+    "assignment",
+    "assignment_execution",
+    "interagency_request",
+    "interagency_response",
+]
 
 
 class AuditChangeRead(ApiModel):

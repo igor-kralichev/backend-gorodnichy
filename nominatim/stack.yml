@@ -8,7 +8,7 @@ services:
     image: municipal-low-code-nominatim:latest
     shm_size: 1g
     environment:
-      PBF_URL: ${NOMINATIM_PBF_URL:-https://download.geofabrik.de/russia/volga-fed-district-latest.osm.pbf}
+      PBF_URL: ${NOMINATIM_PBF_URL:-https://www.osmlab.ru/regions/RU-NIZ.pbf}
       REPLICATION_URL: ${NOMINATIM_REPLICATION_URL:-}
       UPDATE_MODE: ${NOMINATIM_UPDATE_MODE:-none}
       FREEZE: ${NOMINATIM_FREEZE:-true}

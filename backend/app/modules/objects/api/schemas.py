@@ -15,7 +15,15 @@ DisplayValue = str | list[str] | None
 class GeoJsonGeometry(ApiModel):
     """Геометрия в формате GeoJSON и системе координат WGS 84 (EPSG:4326)."""
 
-    type: Literal["Point", "LineString", "Polygon", "GeometryCollection"] = Field(
+    type: Literal[
+        "Point",
+        "MultiPoint",
+        "LineString",
+        "MultiLineString",
+        "Polygon",
+        "MultiPolygon",
+        "GeometryCollection",
+    ] = Field(
         description="Тип геометрии GeoJSON"
     )
     coordinates: list[Any] | None = Field(
@@ -90,6 +98,14 @@ class EntityObjectCreate(ApiModel):
             "сущностей и запрещён для корневых сущностей."
         ),
     )
+    owner_organization_id: UUID | None = Field(
+        default=None,
+        description="Организация-владелец записи; по умолчанию владелец реестра",
+    )
+    responsible_id: UUID | None = Field(
+        default=None,
+        description="UUID ответственного пользователя Keycloak",
+    )
     geometry: GeoJsonGeometry | None = Field(
         default=None,
         description="Геометрия объекта; обязательность задаёт схема",
@@ -107,6 +123,14 @@ class EntityObjectPatch(ApiModel):
         default=None,
         description="Новая геометрия или null для её удаления",
     )
+    owner_organization_id: UUID | None = Field(
+        default=None,
+        description="Новая организация-владелец или null",
+    )
+    responsible_id: UUID | None = Field(
+        default=None,
+        description="Новый ответственный или null",
+    )
     revision: Annotated[
         int,
         Field(
@@ -120,8 +144,12 @@ class EntityObjectPatch(ApiModel):
 
     @model_validator(mode="after")
     def require_change(self) -> "EntityObjectPatch":
-        if self.values is None and "geometry" not in self.model_fields_set:
-            raise ValueError("Необходимо передать values или geometry")
+        if self.values is None and not {
+            "geometry",
+            "owner_organization_id",
+            "responsible_id",
+        }.intersection(self.model_fields_set):
+            raise ValueError("Необходимо передать values, geometry, ownerOrganizationId или responsibleId")
         return self
 
 
@@ -172,6 +200,10 @@ class ObjectSearch(ApiModel):
         default=None,
         description="Ограничить поиск дочерними объектами указанного родителя",
     )
+    bbox: tuple[float, float, float, float] | None = Field(
+        default=None,
+        description="Область карты: minLon, minLat, maxLon, maxLat",
+    )
     limit: int = Field(
         default=25,
         ge=1,
@@ -196,6 +228,9 @@ class EntityObjectRead(ApiModel):
     entity_id: UUID
     entity_code: str
     parent_object_id: UUID | None
+    schema_version_id: UUID
+    owner_organization_id: UUID | None
+    responsible_id: UUID | None
     values: dict[str, ObjectValue]
     display_values: dict[str, DisplayValue] = Field(
         default_factory=dict,
@@ -217,6 +252,7 @@ class EntityObjectRead(ApiModel):
     updated_at: datetime
     created_by: UUID | None
     updated_by: UUID | None
+    archived_at: datetime | None
 
 
 class EntityObjectPage(ApiModel):
@@ -227,6 +263,19 @@ class EntityObjectPage(ApiModel):
     offset: int
     limit: int
     data: list[EntityObjectRead]
+
+
+class ObjectClusterRead(ApiModel):
+    """Кластер объектов для текущего масштаба карты."""
+
+    longitude: float
+    latitude: float
+    count: int
+
+
+class ObjectClusterPage(ApiModel):
+    clusters: list[ObjectClusterRead]
+    total_objects: int
 
 
 class EntityObjectBulkCreateRead(ApiModel):

@@ -27,9 +27,12 @@ JobId = Annotated[UUID, Path(alias="jobId", description="UUID фоновой з�
 )
 async def get_import_job(
     job_id: JobId,
+    actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> ObjectImportJobRead:
-    return await _execute(ObjectImportService(session, get_minio_client()).get(job_id))
+    return await _execute(
+        ObjectImportService(session, get_minio_client()).get(job_id, actor.id)
+    )
 
 
 @router.post(
@@ -45,8 +48,13 @@ async def command_import_job(
     actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> ObjectImportJobRead:
-    del actor
-    return await _execute(ObjectImportService(session, get_minio_client()).command(job_id, payload.command))
+    return await _execute(
+        ObjectImportService(session, get_minio_client()).command(
+            job_id,
+            payload.command,
+            actor.id,
+        )
+    )
 
 
 @websocket_router.websocket("/{jobId}/ws")
@@ -56,7 +64,7 @@ async def import_job_websocket(websocket: WebSocket, job_id: JobId) -> None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     try:
-        actor_from_token(token)
+        actor = actor_from_token(token)
     except HTTPException:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
@@ -67,7 +75,7 @@ async def import_job_websocket(websocket: WebSocket, job_id: JobId) -> None:
             async with session_factory() as session:
                 service = ObjectImportService(session, get_minio_client())
                 try:
-                    job = await service.get(job_id)
+                    job = await service.get(job_id, actor.id)
                 except RuntimeEntityNotFound:
                     await websocket.send_json({"error": "import_job_not_found"})
                     await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -82,7 +90,7 @@ async def import_job_websocket(websocket: WebSocket, job_id: JobId) -> None:
                     continue
                 command = message.get("command") if isinstance(message, dict) else None
                 if command in {"pause", "resume", "cancel"}:
-                    updated = await service.command(job_id, command)
+                    updated = await service.command(job_id, command, actor.id)
                     await websocket.send_json(updated.model_dump(mode="json", by_alias=True))
     except WebSocketDisconnect:
         return

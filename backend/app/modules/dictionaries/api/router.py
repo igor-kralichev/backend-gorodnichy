@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session
-from app.core.security import AdminActor
+from app.core.security import AdminActor, CurrentActor
 from app.modules.audit.application.service import AuditService
 from app.modules.dictionaries.api.schemas import (
     DictionaryCreate,
@@ -35,6 +35,7 @@ DictionaryId = Annotated[UUID, Path(alias="dictionaryId", description="UUID сп
     description="Архивные справочники по умолчанию исключены из рабочего списка.",
 )
 async def list_dictionaries(
+    _actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
     entity_id: Annotated[
         UUID | None,
@@ -105,6 +106,7 @@ async def create_dictionary(
 )
 async def get_dictionary(
     dictionary_id: DictionaryId,
+    _actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> DictionaryRead:
     try:

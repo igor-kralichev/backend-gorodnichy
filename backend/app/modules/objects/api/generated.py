@@ -249,7 +249,7 @@ def _operation(
     item: bool = False,
     request_schema: dict[str, Any] | None = None,
     response_status: str,
-    requires_auth: bool = False,
+    requires_auth: bool = True,
 ) -> dict[str, Any]:
     operation: dict[str, Any] = {
         "summary": summary,

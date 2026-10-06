@@ -31,7 +31,7 @@ from app.modules.entities.infrastructure.models import (
     EntitySchemaVersionModel,
 )
 from app.modules.entities.infrastructure.repository import SqlAlchemyEntitySchemaRepository
-from app.shared.db.models import DictionaryModel, MunicipalityModel, OutboxEventModel
+from app.shared.db.models import DictionaryModel, MunicipalityModel, OrganizationModel, OutboxEventModel
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +125,18 @@ class CreateEntitySchemaService:
                     "Родительская сущность из parentEntityId не найдена"
                 )
 
+        if command.owner_organization_id is not None:
+            organization_id = await self._session.scalar(
+                select(OrganizationModel.id).where(
+                    OrganizationModel.id == command.owner_organization_id,
+                    OrganizationModel.active.is_(True),
+                )
+            )
+            if organization_id is None:
+                raise EntityFieldReferenceError(
+                    "Организация из ownerOrganizationId не найдена или неактивна"
+                )
+
         dictionary_ids = {
             field.enum_id for field in command.fields if field.enum_id is not None
         }
@@ -187,6 +199,7 @@ class CreateEntitySchemaService:
             status="draft",
             current_version=1,
             scope_municipality_id=command.scope_municipality_id,
+            owner_organization_id=command.owner_organization_id,
             layer_selectable=(
                 command.map_settings.selectable if command.map_settings else True
             ),
@@ -263,7 +276,7 @@ class CreateEntitySchemaService:
             used_codes.add(code)
             result.append(
                 EntityFieldModel(
-                    id=uuid4(),
+                    id=field.id or uuid4(),
                     code=code,
                     name=field.name.strip(),
                     field_type=field.type.value,
@@ -275,6 +288,19 @@ class CreateEntitySchemaService:
                     sort_order=index,
                     dictionary_id=field.enum_id,
                     reference_entity_schema_id=field.reference_entity_id,
+                    hint=field.hint.strip() if field.hint else None,
+                    default_value=field.default_value,
+                    group_name=field.group.strip() if field.group else None,
+                    min_length=field.min_length,
+                    max_length=field.max_length,
+                    min_value=field.min_value,
+                    max_value=field.max_value,
+                    unique_value=field.unique,
+                    multiple=field.multiple,
+                    read_only=field.read_only,
+                    archived=field.archived,
+                    access_rules=field.access,
+                    formula=field.formula,
                 )
             )
         return result
@@ -358,12 +384,26 @@ class CreateEntitySchemaService:
                     order=field.sort_order,
                     enum_id=field.dictionary_id,
                     reference_entity_id=field.reference_entity_schema_id,
+                    hint=field.hint,
+                    default_value=field.default_value,
+                    group=field.group_name,
+                    min_length=field.min_length,
+                    max_length=field.max_length,
+                    min_value=float(field.min_value) if field.min_value is not None else None,
+                    max_value=float(field.max_value) if field.max_value is not None else None,
+                    unique=field.unique_value,
+                    multiple=field.multiple,
+                    read_only=field.read_only,
+                    archived=field.archived,
+                    access=field.access_rules,
+                    formula=field.formula,
                 )
                 for field in sorted(entity.fields, key=lambda item: item.sort_order)
             ],
             status=entity.status,
             version=entity.current_version,
             scope_municipality_id=entity.scope_municipality_id,
+            owner_organization_id=entity.owner_organization_id,
             created_at=entity.created_at,
             updated_at=entity.updated_at,
         )

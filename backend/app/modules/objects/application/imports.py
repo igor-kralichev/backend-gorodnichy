@@ -13,6 +13,7 @@ from starlette.concurrency import run_in_threadpool
 from app.core.config import settings
 from app.core.rabbitmq import publish_json
 from app.core.storage import ensure_bucket_exists
+from app.core.security import ActorContext
 from app.modules.entities.infrastructure.models import EntitySchemaModel
 from app.modules.objects.api.schemas import EntityObjectCreate, ObjectImportJobRead
 from app.modules.objects.application.service import RuntimeEntityNotFound, RuntimeValidationError
@@ -73,13 +74,20 @@ class ObjectImportService:
         source_name: str,
         content: bytes,
         total_rows: int,
-        actor_id: UUID,
+        actor: ActorContext,
+        source_format: str = "json",
+        mapping: dict[str, object] | None = None,
+        content_type: str = "application/json",
     ) -> ObjectImportJobRead:
-        """Сохранить временный JSON в MinIO и поставить импорт в RabbitMQ."""
+        """Сохранить временный источник в MinIO и поставить импорт в RabbitMQ."""
 
-        schema = await self._get_schema(entity_code)
+        async with self._session.begin():
+            schema = await self._get_schema(entity_code)
+            schema_id = schema.id
         job_id = uuid4()
-        object_key = f"{settings.import_temp_prefix.strip('/')}/{job_id}.json"
+        if source_format not in {"json", "xlsx"}:
+            raise ValueError("Неподдерживаемый формат импорта")
+        object_key = f"{settings.import_temp_prefix.strip('/')}/{job_id}.{source_format}"
         uploaded = False
         try:
             await run_in_threadpool(ensure_bucket_exists, self._storage, settings.minio_bucket)
@@ -89,22 +97,22 @@ class ObjectImportService:
                 object_key,
                 io.BytesIO(content),
                 len(content),
-                "application/json",
+                content_type,
             )
             uploaded = True
 
             async with self._session.begin():
                 job = ImportJobModel(
                     id=job_id,
-                    entity_schema_id=schema.id,
+                    entity_schema_id=schema_id,
                     status="queued",
                     source_name=source_name,
                     source_object_key=object_key,
-                    mapping={},
+                    mapping=mapping or {},
                     total_rows=total_rows,
                     processed_rows=0,
                     error_rows=0,
-                    created_by=actor_id,
+                    created_by=actor.id,
                 )
                 self._session.add(job)
 
@@ -114,7 +122,13 @@ class ObjectImportService:
                     "jobId": str(job_id),
                     "entityCode": entity_code,
                     "sourceObjectKey": object_key,
-                    "actorId": str(actor_id),
+                    "actorId": str(actor.id),
+                    "actorRoles": sorted(actor.roles),
+                    "actorUsername": actor.username,
+                    "actorDisplayName": actor.display_name,
+                    "actorEmail": actor.email,
+                    "sourceFormat": source_format,
+                    "mapping": mapping or {},
                 },
             )
         except Exception:
@@ -129,15 +143,32 @@ class ObjectImportService:
         await self._session.refresh(job)
         return self.to_read_model(job)
 
-    async def get(self, job_id: UUID) -> ObjectImportJobRead:
-        job = await self._session.get(ImportJobModel, job_id)
+    async def get(self, job_id: UUID, actor_id: UUID) -> ObjectImportJobRead:
+        job = await self._session.scalar(
+            select(ImportJobModel).where(
+                ImportJobModel.id == job_id,
+                ImportJobModel.created_by == actor_id,
+            )
+        )
         if job is None:
             raise RuntimeEntityNotFound
         return self.to_read_model(job)
 
-    async def command(self, job_id: UUID, command: str) -> ObjectImportJobRead:
+    async def command(
+        self,
+        job_id: UUID,
+        command: str,
+        actor_id: UUID,
+    ) -> ObjectImportJobRead:
         async with self._session.begin():
-            job = await self._session.get(ImportJobModel, job_id, with_for_update=True)
+            job = await self._session.scalar(
+                select(ImportJobModel)
+                .where(
+                    ImportJobModel.id == job_id,
+                    ImportJobModel.created_by == actor_id,
+                )
+                .with_for_update()
+            )
             if job is None:
                 raise RuntimeEntityNotFound
             if command == "pause" and job.status in {"queued", "running"}:

@@ -9,12 +9,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_session
 from app.core.security import CurrentActor
 from app.core.storage import get_minio_client
+from app.modules.access.api.schemas import PermissionAction
+from app.modules.access.application.service import (
+    AccessDenied,
+    AccessResourceNotFound,
+    AuthorizationService,
+)
 from app.modules.attachments.api.schemas import (
     AttachmentDeleteRead,
     AttachmentKind,
     AttachmentPage,
     AttachmentRead,
     AttachmentUpdate,
+    AttachmentVersionRead,
 )
 from app.modules.attachments.application.service import AttachmentService
 from app.modules.attachments.domain.errors import AttachmentNotFound, AttachmentValidationError
@@ -37,11 +44,13 @@ AttachmentId = Annotated[UUID, Path(alias="attachmentId", description="Иден�
 async def list_object_attachments(
     entity_code: EntityCode,
     object_id: ObjectId,
+    actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
     kind: AttachmentKind | None = Query(default=None, description="Фильтр по типу файла"),
     limit: int = Query(default=50, ge=1, le=500, description="Количество файлов на странице"),
     offset: int = Query(default=0, ge=0, description="Смещение от начала списка"),
 ) -> AttachmentPage:
+    await _authorize(session, actor, "read", entity_code, object_id)
     return await _execute(
         _service(session).list_page(
             entity_code=entity_code,
@@ -69,6 +78,7 @@ async def upload_object_attachment(
     kind: AttachmentKind = Query(description="Тип файла: photo или document"),
     file: UploadFile = File(description="PDF, DOC, DOCX или изображение"),
 ) -> AttachmentRead:
+    await _authorize(session, actor, "update", entity_code, object_id)
     response = await _execute(
         _service(session).upload(
             entity_code=entity_code,
@@ -102,8 +112,10 @@ async def get_object_attachment(
     entity_code: EntityCode,
     object_id: ObjectId,
     attachment_id: AttachmentId,
+    actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> AttachmentRead:
+    await _authorize(session, actor, "read", entity_code, object_id)
     return await _execute(
         _service(session).get(
             entity_code=entity_code,
@@ -122,13 +134,69 @@ async def download_object_attachment(
     entity_code: EntityCode,
     object_id: ObjectId,
     attachment_id: AttachmentId,
+    actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> StreamingResponse:
+    await _authorize(session, actor, "read", entity_code, object_id)
     metadata, storage_response = await _execute(
         _service(session).download(
             entity_code=entity_code,
             object_id=object_id,
             attachment_id=attachment_id,
+        )
+    )
+    return StreamingResponse(
+        _iter_storage_response(storage_response),
+        media_type=metadata.mime_type,
+        headers={
+            "Content-Disposition": _content_disposition(metadata.original_name),
+            "Content-Length": str(metadata.size_bytes),
+        },
+    )
+
+
+@router.get(
+    "/{entityCode}/objects/{objectId}/attachments/{attachmentId}/versions",
+    response_model=list[AttachmentVersionRead],
+    response_model_by_alias=True,
+    summary="Получить версии файла",
+)
+async def list_object_attachment_versions(
+    entity_code: EntityCode,
+    object_id: ObjectId,
+    attachment_id: AttachmentId,
+    actor: CurrentActor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> list[AttachmentVersionRead]:
+    await _authorize(session, actor, "read", entity_code, object_id)
+    return await _execute(
+        _service(session).list_versions(
+            entity_code=entity_code,
+            object_id=object_id,
+            attachment_id=attachment_id,
+        )
+    )
+
+
+@router.get(
+    "/{entityCode}/objects/{objectId}/attachments/{attachmentId}/versions/{version}/download",
+    summary="Скачать выбранную версию файла",
+)
+async def download_object_attachment_version(
+    entity_code: EntityCode,
+    object_id: ObjectId,
+    attachment_id: AttachmentId,
+    version: Annotated[int, Path(ge=1)],
+    actor: CurrentActor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> StreamingResponse:
+    await _authorize(session, actor, "read", entity_code, object_id)
+    metadata, storage_response = await _execute(
+        _service(session).download_version(
+            entity_code=entity_code,
+            object_id=object_id,
+            attachment_id=attachment_id,
+            version=version,
         )
     )
     return StreamingResponse(
@@ -155,6 +223,7 @@ async def update_object_attachment(
     actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> AttachmentRead:
+    await _authorize(session, actor, "update", entity_code, object_id)
     service = _service(session)
     before = await _execute(service.get(entity_code=entity_code, object_id=object_id, attachment_id=attachment_id))
     await session.rollback()
@@ -186,7 +255,7 @@ async def update_object_attachment(
     response_model=AttachmentRead,
     response_model_by_alias=True,
     summary="Заменить файл",
-    description="Заменяет содержимое в MinIO, сохраняя тот же UUID и технический ключ файла.",
+    description="Создаёт новую неизменяемую версию содержимого, сохраняя UUID файла.",
 )
 async def replace_object_attachment_file(
     entity_code: EntityCode,
@@ -196,6 +265,7 @@ async def replace_object_attachment_file(
     session: Annotated[AsyncSession, Depends(get_session)],
     file: UploadFile = File(description="Новый файл того же типа: фото или документ"),
 ) -> AttachmentRead:
+    await _authorize(session, actor, "update", entity_code, object_id)
     service = _service(session)
     before = await _execute(service.get(entity_code=entity_code, object_id=object_id, attachment_id=attachment_id))
     await session.rollback()
@@ -236,6 +306,7 @@ async def delete_object_attachment(
     actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> AttachmentDeleteRead:
+    await _authorize(session, actor, "update", entity_code, object_id)
     service = _service(session)
     before = await _execute(service.get(entity_code=entity_code, object_id=object_id, attachment_id=attachment_id))
     await session.rollback()
@@ -275,6 +346,28 @@ async def _execute[ResultT](awaitable: Awaitable[ResultT]) -> ResultT:
         raise HTTPException(status_code=404, detail="Файл объекта не найден") from error
     except AttachmentValidationError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+async def _authorize(
+    session: AsyncSession,
+    actor,
+    action: PermissionAction,
+    entity_code: str,
+    object_id: UUID,
+) -> None:
+    try:
+        await AuthorizationService(session).require_entity_code(
+            actor,
+            action,
+            entity_code,
+            object_id=object_id,
+        )
+    except AccessDenied as error:
+        raise HTTPException(status_code=403, detail="Недостаточно прав для файла объекта") from error
+    except AccessResourceNotFound as error:
+        raise HTTPException(status_code=404, detail="Сущность или объект не найден") from error
+    finally:
+        await session.rollback()
 
 
 def _iter_storage_response(storage_response: object) -> Iterator[bytes]:

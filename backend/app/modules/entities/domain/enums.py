@@ -32,6 +32,10 @@ class FieldType(StrEnum):
     ENUM = "enum"
     REFERENCE = "reference"
     FILE = "file"
+    PHONE = "phone"
+    EMAIL = "email"
+    URL = "url"
+    CALCULATED = "calculated"
 
 
 class MapRuleOperator(StrEnum):

@@ -30,6 +30,22 @@ class AttachmentRead(ApiModel):
     uploaded_by: UUID | None = Field(default=None, description="UUID пользователя, загрузившего файл")
     created_at: datetime = Field(description="Дата загрузки")
     updated_at: datetime = Field(description="Дата изменения")
+    current_version: int = Field(ge=1, description="Текущая версия содержимого")
+    scan_status: str = Field(description="Статус проверки файла")
+
+
+class AttachmentVersionRead(ApiModel):
+    """Неизменяемая версия содержимого файла."""
+
+    id: UUID
+    attachment_id: UUID
+    version: int
+    original_name: str
+    mime_type: str
+    size_bytes: int
+    checksum_sha256: str
+    uploaded_by: UUID | None
+    created_at: datetime
 
 
 class AttachmentPage(ApiModel):

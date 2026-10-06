@@ -13,11 +13,17 @@ from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.core.storage import ensure_bucket_exists
-from app.modules.attachments.api.schemas import AttachmentDeleteRead, AttachmentKind, AttachmentPage, AttachmentRead
+from app.modules.attachments.api.schemas import (
+    AttachmentDeleteRead,
+    AttachmentKind,
+    AttachmentPage,
+    AttachmentRead,
+    AttachmentVersionRead,
+)
 from app.modules.attachments.domain.errors import AttachmentNotFound, AttachmentValidationError
 from app.modules.entities.infrastructure.models import EntitySchemaModel
 from app.modules.objects.application.service import RuntimeEntityNotFound, RuntimeObjectNotFound
-from app.shared.db.models import AttachmentModel, EntityObjectModel
+from app.shared.db.models import AttachmentModel, AttachmentVersionModel, EntityObjectModel
 
 PHOTO_MIME_PREFIX = "image/"
 PHOTO_EXTENSIONS = {".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp"}
@@ -84,7 +90,7 @@ class AttachmentService:
         payload = await self._file_payload(file)
         self._validate_file(kind, payload["original_name"], payload["mime_type"], payload["size"])
         attachment_id = uuid4()
-        object_key = f"{model.id}/{attachment_id}"
+        object_key = f"{model.id}/{attachment_id}/v1"
         await self._put_object(object_key, payload["content"], payload["mime_type"])
         attachment = AttachmentModel(
             id=attachment_id,
@@ -97,8 +103,22 @@ class AttachmentService:
             size_bytes=payload["size"],
             checksum_sha256=payload["checksum"],
             uploaded_by=actor_id,
+            current_version=1,
+            scan_status="clean",
         )
         self._session.add(attachment)
+        self._session.add(
+            AttachmentVersionModel(
+                attachment_id=attachment_id,
+                version=1,
+                object_key=object_key,
+                original_name=payload["original_name"],
+                mime_type=payload["mime_type"],
+                size_bytes=payload["size"],
+                checksum_sha256=payload["checksum"],
+                uploaded_by=actor_id,
+            )
+        )
         model.attachment_paths = _add_path(model.attachment_paths, object_key)
         await self._session.commit()
         await self._session.refresh(attachment)
@@ -148,12 +168,33 @@ class AttachmentService:
         schema, _, attachment = await self._attachment_context(entity_code, object_id, attachment_id, for_update=True)
         payload = await self._file_payload(file)
         self._validate_file(attachment.kind, payload["original_name"], payload["mime_type"], payload["size"])
-        await self._put_object(attachment.object_key, payload["content"], payload["mime_type"])
+        previous_key = attachment.object_key
+        next_version = attachment.current_version + 1
+        object_key = f"{object_id}/{attachment.id}/v{next_version}"
+        await self._put_object(object_key, payload["content"], payload["mime_type"])
+        attachment.object_key = object_key
         attachment.original_name = payload["original_name"]
         attachment.mime_type = payload["mime_type"]
         attachment.size_bytes = payload["size"]
         attachment.checksum_sha256 = payload["checksum"]
         attachment.uploaded_by = actor_id
+        attachment.current_version = next_version
+        attachment.scan_status = "clean"
+        self._session.add(
+            AttachmentVersionModel(
+                attachment_id=attachment.id,
+                version=next_version,
+                object_key=object_key,
+                original_name=payload["original_name"],
+                mime_type=payload["mime_type"],
+                size_bytes=payload["size"],
+                checksum_sha256=payload["checksum"],
+                uploaded_by=actor_id,
+            )
+        )
+        model = await self._session.get(EntityObjectModel, object_id, with_for_update=True)
+        if model is not None:
+            model.attachment_paths = _replace_path(model.attachment_paths, previous_key, object_key)
         await self._session.commit()
         await self._session.refresh(attachment)
         return self._to_response(schema, attachment)
@@ -166,11 +207,54 @@ class AttachmentService:
         attachment_id: UUID,
     ) -> AttachmentDeleteRead:
         _, model, attachment = await self._attachment_context(entity_code, object_id, attachment_id, for_update=True)
-        await self._remove_object(attachment.object_key)
+        version_keys = list(
+            await self._session.scalars(
+                select(AttachmentVersionModel.object_key).where(
+                    AttachmentVersionModel.attachment_id == attachment.id
+                )
+            )
+        )
+        for object_key in version_keys:
+            await self._remove_object(object_key)
         await self._session.delete(attachment)
         model.attachment_paths = _remove_path(model.attachment_paths, attachment.object_key)
         await self._session.commit()
         return AttachmentDeleteRead(id=attachment_id, deleted=True)
+
+    async def list_versions(
+        self, *, entity_code: str, object_id: UUID, attachment_id: UUID
+    ) -> list[AttachmentVersionRead]:
+        await self._attachment_context(entity_code, object_id, attachment_id)
+        rows = (
+            await self._session.scalars(
+                select(AttachmentVersionModel)
+                .where(AttachmentVersionModel.attachment_id == attachment_id)
+                .order_by(AttachmentVersionModel.version.desc())
+            )
+        ).all()
+        return [AttachmentVersionRead.model_validate(row, from_attributes=True) for row in rows]
+
+    async def download_version(
+        self,
+        *,
+        entity_code: str,
+        object_id: UUID,
+        attachment_id: UUID,
+        version: int,
+    ) -> tuple[AttachmentVersionRead, Any]:
+        await self._attachment_context(entity_code, object_id, attachment_id)
+        model = await self._session.scalar(
+            select(AttachmentVersionModel).where(
+                AttachmentVersionModel.attachment_id == attachment_id,
+                AttachmentVersionModel.version == version,
+            )
+        )
+        if model is None:
+            raise AttachmentNotFound
+        response = await run_in_threadpool(
+            self._storage.get_object, settings.minio_bucket, model.object_key
+        )
+        return AttachmentVersionRead.model_validate(model, from_attributes=True), response
 
     async def _object_context(
         self,
@@ -279,6 +363,8 @@ class AttachmentService:
             uploaded_by=attachment.uploaded_by,
             created_at=attachment.created_at,
             updated_at=attachment.updated_at,
+            current_version=attachment.current_version,
+            scan_status=attachment.scan_status,
         )
 
 
@@ -290,11 +376,19 @@ def _extension(filename: str) -> str:
 async def delete_object_storage_files(session: AsyncSession, storage: Minio, object_id: UUID) -> None:
     """Удалить из MinIO все файлы объекта перед физическим удалением объекта."""
 
-    object_keys = (
+    current_keys = list(
         await session.scalars(
             select(AttachmentModel.object_key).where(AttachmentModel.object_id == object_id)
         )
-    ).all()
+    )
+    version_keys = list(
+        await session.scalars(
+            select(AttachmentVersionModel.object_key)
+            .join(AttachmentModel, AttachmentModel.id == AttachmentVersionModel.attachment_id)
+            .where(AttachmentModel.object_id == object_id)
+        )
+    )
+    object_keys = list(dict.fromkeys([*current_keys, *version_keys]))
     if not object_keys:
         return
     await run_in_threadpool(ensure_bucket_exists, storage, settings.minio_bucket)
@@ -311,3 +405,7 @@ def _add_path(paths: list[str] | None, path: str) -> list[str]:
 
 def _remove_path(paths: list[str] | None, path: str) -> list[str]:
     return [item for item in paths or [] if item != path]
+
+
+def _replace_path(paths: list[str] | None, old_path: str, new_path: str) -> list[str]:
+    return [new_path if item == old_path else item for item in paths or []]

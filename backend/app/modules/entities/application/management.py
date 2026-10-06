@@ -513,6 +513,7 @@ class EntitySchemaManagementService:
             "fields",
             "map_settings",
             "scope_municipality_id",
+            "owner_organization_id",
         ):
             if field_name in payload.model_fields_set:
                 updates[field_name] = getattr(payload, field_name)
@@ -545,6 +546,7 @@ class EntitySchemaManagementService:
             ),
             fields=[
                 EntityFieldCreate(
+                    id=field.id,
                     code=field.code,
                     name=field.name,
                     type=FieldType(field.field_type),
@@ -555,6 +557,19 @@ class EntitySchemaManagementService:
                     filterable=field.filterable,
                     enum_id=field.dictionary_id,
                     reference_entity_id=field.reference_entity_schema_id,
+                    hint=field.hint,
+                    default_value=field.default_value,
+                    group=field.group_name,
+                    min_length=field.min_length,
+                    max_length=field.max_length,
+                    min_value=float(field.min_value) if field.min_value is not None else None,
+                    max_value=float(field.max_value) if field.max_value is not None else None,
+                    unique=field.unique_value,
+                    multiple=field.multiple,
+                    read_only=field.read_only,
+                    archived=field.archived,
+                    access=field.access_rules,
+                    formula=field.formula,
                 )
                 for field in sorted(entity.fields, key=lambda item: item.sort_order)
             ],
@@ -589,6 +604,7 @@ class EntitySchemaManagementService:
                 visible_by_default=entity.layer_visible_by_default,
             ),
             scope_municipality_id=entity.scope_municipality_id,
+            owner_organization_id=entity.owner_organization_id,
         )
 
     async def _check_safe_schema_change(
@@ -636,6 +652,7 @@ class EntitySchemaManagementService:
         entity.geometry_type = prototype.geometry_type
         entity.clustering_enabled = prototype.clustering_enabled
         entity.scope_municipality_id = prototype.scope_municipality_id
+        entity.owner_organization_id = prototype.owner_organization_id
         entity.layer_selectable = prototype.layer_selectable
         entity.layer_visible_by_default = prototype.layer_visible_by_default
 
@@ -663,6 +680,19 @@ class EntitySchemaManagementService:
             applied_field.reference_entity_schema_id = (
                 desired_field.reference_entity_schema_id
             )
+            applied_field.hint = desired_field.hint
+            applied_field.default_value = desired_field.default_value
+            applied_field.group_name = desired_field.group_name
+            applied_field.min_length = desired_field.min_length
+            applied_field.max_length = desired_field.max_length
+            applied_field.min_value = desired_field.min_value
+            applied_field.max_value = desired_field.max_value
+            applied_field.unique_value = desired_field.unique_value
+            applied_field.multiple = desired_field.multiple
+            applied_field.read_only = desired_field.read_only
+            applied_field.archived = desired_field.archived
+            applied_field.access_rules = desired_field.access_rules
+            applied_field.formula = desired_field.formula
             applied_fields.append(applied_field)
         entity.fields = applied_fields
 

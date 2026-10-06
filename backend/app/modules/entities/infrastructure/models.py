@@ -47,6 +47,9 @@ class EntitySchemaModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     parent_entity_schema_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("entity_schemas.id", ondelete="SET NULL")
     )
+    owner_organization_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id", ondelete="RESTRICT")
+    )
     scope_municipality_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("municipalities.id", ondelete="RESTRICT")
     )
@@ -116,7 +119,7 @@ class EntityFieldModel(UUIDPrimaryKeyMixin, Base):
         UniqueConstraint("entity_schema_id", "sort_order", name="entity_field_order"),
         CheckConstraint(
             "field_type in ('string', 'text', 'integer', 'decimal', 'boolean', 'date', 'datetime', "
-            "'address', 'enum', 'reference', 'file')",
+            "'address', 'enum', 'reference', 'file', 'phone', 'email', 'url', 'calculated')",
             name="field_type",
         ),
         CheckConstraint("sort_order > 0", name="positive_sort_order"),
@@ -136,6 +139,19 @@ class EntityFieldModel(UUIDPrimaryKeyMixin, Base):
     searchable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     filterable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    hint: Mapped[str | None] = mapped_column(Text)
+    default_value: Mapped[Any | None] = mapped_column(JSONB)
+    group_name: Mapped[str | None] = mapped_column(String(255))
+    min_length: Mapped[int | None] = mapped_column(Integer)
+    max_length: Mapped[int | None] = mapped_column(Integer)
+    min_value: Mapped[float | None] = mapped_column(Numeric)
+    max_value: Mapped[float | None] = mapped_column(Numeric)
+    unique_value: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    multiple: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    read_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    access_rules: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    formula: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     dictionary_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("dictionaries.id", ondelete="RESTRICT")
     )

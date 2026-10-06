@@ -3,7 +3,8 @@ from collections.abc import Awaitable
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, Path, Query, Request, UploadFile, status
+import orjson
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,15 +13,23 @@ from app.core.database import get_session
 from app.core.security import CurrentActor
 from app.core.storage import get_minio_client
 from app.modules.attachments.application.service import delete_object_storage_files
+from app.modules.access.api.schemas import PermissionAction
+from app.modules.access.application.service import (
+    AccessDenied,
+    AccessResourceNotFound,
+    AuthorizationService,
+)
 from app.modules.audit.application.service import AuditService
 from app.modules.objects.api.schemas import (
     EntityObjectBulkCreateRead,
+    EntityObjectCreate,
     EntityObjectDeleteRead,
     EntityObjectPage,
     EntityObjectPatch,
     EntityObjectRead,
     EntityObjectStatusRead,
     ObjectFilter,
+    ObjectClusterPage,
     ObjectImportJobRead,
     ObjectSearch,
 )
@@ -69,6 +78,7 @@ ObjectId = Annotated[UUID, Path(alias="objectId", description="Идентифи�
 async def list_entity_objects(
     entity_code: EntityCode,
     request: Request,
+    actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
     parent_object_id: Annotated[
         UUID | None,
@@ -90,7 +100,12 @@ async def list_entity_objects(
         description="Количество объектов на странице",
     ),
     offset: int = Query(default=0, ge=0, description="Смещение от начала выборки"),
+    bbox: Annotated[
+        str | None,
+        Query(description="Область карты в формате minLon,minLat,maxLon,maxLat"),
+    ] = None,
 ) -> EntityObjectPage:
+    await _authorize(session, actor, "read", entity_code)
     filters = _query_filters(request)
     return await _execute(
         RuntimeObjectService(session).list_page(
@@ -100,10 +115,30 @@ async def list_entity_objects(
                 filters=filters,
                 sort=sort,
                 parent_object_id=parent_object_id,
+                bbox=_parse_bbox(bbox) if bbox else None,
                 limit=limit,
                 offset=offset,
             ),
         )
+    )
+
+
+@router.get(
+    "/{entityCode}/objects/clusters",
+    response_model=ObjectClusterPage,
+    response_model_by_alias=True,
+    summary="Получить кластеры объектов в области карты",
+)
+async def list_entity_object_clusters(
+    entity_code: EntityCode,
+    bbox: Annotated[str, Query(description="minLon,minLat,maxLon,maxLat")],
+    zoom: Annotated[int, Query(ge=0, le=24)],
+    actor: CurrentActor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ObjectClusterPage:
+    await _authorize(session, actor, "read", entity_code)
+    return await _execute(
+        RuntimeObjectService(session).list_clusters(entity_code, _parse_bbox(bbox), zoom)
     )
 
 
@@ -120,8 +155,10 @@ async def list_entity_objects(
 async def search_entity_objects(
     entity_code: EntityCode,
     payload: ObjectSearch,
+    actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> EntityObjectPage:
+    await _authorize(session, actor, "read", entity_code)
     return await _execute(RuntimeObjectService(session).list_page(entity_code, payload))
 
 
@@ -134,8 +171,10 @@ async def search_entity_objects(
 async def get_entity_object(
     entity_code: EntityCode,
     object_id: ObjectId,
+    actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> EntityObjectRead:
+    await _authorize(session, actor, "read", entity_code, object_id)
     return await _execute(RuntimeObjectService(session).get(entity_code, object_id))
 
 
@@ -146,7 +185,7 @@ async def get_entity_object(
     status_code=status.HTTP_201_CREATED,
     responses={
         status.HTTP_202_ACCEPTED: {
-            "description": "Файл принят в фоновую загрузку",
+            "description": "Массив принят в фоновую загрузку",
             "content": {
                 "application/json": {
                     "schema": {"$ref": "#/components/schemas/ObjectImportJobRead"}
@@ -156,43 +195,32 @@ async def get_entity_object(
     },
     summary="Создать объекты сущности",
     description=(
-        "Принимает multipart/form-data с .json файлом, внутри которого находится "
-        "массив объектов. Небольшие файлы обрабатываются сразу. Большие файлы "
-        "временно сохраняются в MinIO, ставятся в RabbitMQ и обрабатываются "
-        "import-worker в фоне."
+        "Принимает JSON-массив объектов; один объект также передаётся массивом из "
+        "одного элемента. Небольшой массив обрабатывается сразу. Для большого "
+        "массива backend сам создаёт временный JSON в MinIO и передаёт задачу "
+        "import-worker через RabbitMQ."
     ),
 )
 async def create_entity_object(
     entity_code: EntityCode,
-    file: Annotated[
-        UploadFile,
-        File(
-            description=(
-                "JSON-файл с массивом объектов. Один объект тоже передаётся "
-                "как массив из одного элемента."
-            )
-        ),
-    ],
+    payload: list[EntityObjectCreate],
     actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> EntityObjectBulkCreateRead | ObjectImportJobRead:
-    if not _json_file_name(file.filename):
-        raise HTTPException(status_code=422, detail="Необходимо загрузить файл с расширением .json")
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=422, detail="JSON-файл пуст")
-
+    await _authorize(session, actor, "create", entity_code)
     import_service = ObjectImportService(session, get_minio_client())
-    payload = await _execute(import_service.parse_json_objects(content))
 
     if len(payload) > settings.import_async_threshold:
+        content = orjson.dumps(
+            [item.model_dump(mode="json", by_alias=True) for item in payload]
+        )
         job = await _execute(
             import_service.enqueue(
                 entity_code=entity_code,
-                source_name=(file.filename or "objects.json").strip(),
+                source_name=f"{entity_code}-objects.json",
                 content=content,
                 total_rows=len(payload),
-                actor_id=actor.id,
+                actor=actor,
             )
         )
         await AuditService(session).record(
@@ -249,6 +277,7 @@ async def update_entity_object(
     actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> EntityObjectRead:
+    await _authorize(session, actor, "update", entity_code, object_id)
     service = RuntimeObjectService(session)
     before = await _execute(service.get(entity_code, object_id))
     await session.rollback()
@@ -262,6 +291,42 @@ async def update_entity_object(
         action="entity_object.updated",
         old_value=before,
         new_value=response,
+    )
+    return response
+
+
+@router.post(
+    "/{entityCode}/objects/{objectId}/copy",
+    response_model=EntityObjectRead,
+    response_model_by_alias=True,
+    status_code=status.HTTP_201_CREATED,
+    summary="Создать копию объекта",
+    description=(
+        "Копирует значения, геометрию и принадлежность объекта. "
+        "Уникальные, архивные и вычисляемые поля очищаются."
+    ),
+)
+async def copy_entity_object(
+    entity_code: EntityCode,
+    object_id: ObjectId,
+    actor: CurrentActor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> EntityObjectRead:
+    await _authorize(session, actor, "read", entity_code, object_id)
+    await _authorize(session, actor, "create", entity_code)
+    response = await _execute(
+        RuntimeObjectService(session).copy(entity_code, object_id, actor.id)
+    )
+    await AuditService(session).record(
+        actor=actor,
+        resource_type="entity_object",
+        resource_id=response.id,
+        resource_code=entity_code,
+        resource_name=_object_resource_name(response),
+        action="entity_object.copied",
+        old_value=None,
+        new_value=response,
+        metadata={"sourceObjectId": str(object_id)},
     )
     return response
 
@@ -282,6 +347,7 @@ async def archive_entity_object(
     actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> EntityObjectStatusRead:
+    await _authorize(session, actor, "archive", entity_code, object_id)
     service = RuntimeObjectService(session)
     before = await _execute(service.get(entity_code, object_id))
     await session.rollback()
@@ -315,6 +381,7 @@ async def restore_entity_object(
     actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> EntityObjectStatusRead:
+    await _authorize(session, actor, "archive", entity_code, object_id)
     service = RuntimeObjectService(session)
     before = await _execute(service.get(entity_code, object_id))
     await session.rollback()
@@ -348,6 +415,7 @@ async def delete_entity_object(
     actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> EntityObjectDeleteRead:
+    await _authorize(session, actor, "delete", entity_code, object_id)
     service = RuntimeObjectService(session)
     before = await _execute(service.get(entity_code, object_id))
     await session.rollback()
@@ -390,6 +458,28 @@ async def _execute[ResultT](awaitable: Awaitable[ResultT]) -> ResultT:
         ) from error
 
 
+async def _authorize(
+    session: AsyncSession,
+    actor,
+    action: PermissionAction,
+    entity_code: str,
+    object_id: UUID | None = None,
+) -> None:
+    try:
+        await AuthorizationService(session).require_entity_code(
+            actor,
+            action,
+            entity_code,
+            object_id=object_id,
+        )
+    except AccessDenied as error:
+        raise HTTPException(status_code=403, detail="Недостаточно прав для операции") from error
+    except AccessResourceNotFound as error:
+        raise HTTPException(status_code=404, detail="Сущность или объект не найден") from error
+    finally:
+        await session.rollback()
+
+
 def _query_filters(request: Request) -> list[ObjectFilter]:
     filters: list[ObjectFilter] = []
     for key, value in request.query_params.multi_items():
@@ -416,7 +506,14 @@ def _object_resource_name(value: EntityObjectRead) -> str:
     return str(value.id)
 
 
-def _json_file_name(filename: str | None) -> bool:
-    if filename is None:
-        return False
-    return filename.strip().lower().endswith(".json")
+def _parse_bbox(value: str) -> tuple[float, float, float, float]:
+    try:
+        parts = tuple(float(item.strip()) for item in value.split(","))
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="bbox должен содержать четыре числа") from error
+    if len(parts) != 4:
+        raise HTTPException(status_code=422, detail="bbox должен содержать четыре числа")
+    min_lon, min_lat, max_lon, max_lat = parts
+    if not (-180 <= min_lon < max_lon <= 180 and -90 <= min_lat < max_lat <= 90):
+        raise HTTPException(status_code=422, detail="bbox находится за пределами WGS 84")
+    return min_lon, min_lat, max_lon, max_lat

@@ -16,9 +16,17 @@ class Settings(BaseSettings):
     redis_schema_ttl_seconds: int = 3600
     rabbitmq_url: str = "amqp://lowcode:lowcode@rabbitmq:5672/"
     import_queue_name: str = "object-imports"
+    outbox_queue_name: str = "platform-events"
+    outbox_batch_size: int = 100
+    outbox_poll_interval_seconds: float = 1.0
     import_async_threshold: int = 1000
     import_batch_size: int = 500
     import_temp_prefix: str = "imports"
+    excel_max_file_size_bytes: int = 30 * 1024 * 1024
+    excel_max_sheets: int = 20
+    excel_max_rows: int = 50_000
+    excel_max_columns: int = 200
+    excel_max_uncompressed_bytes: int = 200 * 1024 * 1024
     cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["http://localhost:5173"])
     log_level: str = "INFO"
     admin_role_name: str = "Admin"

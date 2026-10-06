@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session
-from app.core.security import AdminActor
+from app.core.security import AdminActor, CurrentActor
 from app.modules.audit.application.service import AuditService
 from app.modules.entities.api.schemas import (
     EntityCreate,
@@ -109,6 +109,7 @@ async def create_entity_schema(
     description="Архивные сущности по умолчанию исключены из рабочего списка.",
 )
 async def list_entity_schemas(
+    _actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
     redis: Annotated[Redis, Depends(get_redis)],
     status_filter: Annotated[
@@ -288,6 +289,7 @@ async def restore_entity_schema(
 )
 async def get_entity_schema(
     identifier: str,
+    _actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
     redis: Annotated[Redis, Depends(get_redis)],
 ) -> EntityRead:
