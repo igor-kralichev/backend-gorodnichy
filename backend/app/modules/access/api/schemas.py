@@ -147,3 +147,23 @@ class SavedViewRead(ApiModel):
 class DeleteRead(ApiModel):
     id: UUID
     deleted: bool = True
+
+
+class CurrentActorRead(ApiModel):
+    """Проверенные данные текущего пользователя из access token."""
+
+    id: UUID
+    username: str | None
+    full_name: str | None
+    email: str | None
+    roles: list[str]
+
+
+class EffectiveCapabilitiesRead(ApiModel):
+    """Результат той же проверки прав, которую применяют mutation endpoints."""
+
+    actor: CurrentActorRead
+    entity_code: str | None = None
+    object_id: UUID | None = None
+    actions: list[PermissionAction]
+    field_actions: dict[str, list[PermissionAction]] = Field(default_factory=dict)

@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 import orjson
 from minio import Minio
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -15,7 +15,11 @@ from app.core.rabbitmq import publish_json
 from app.core.storage import ensure_bucket_exists
 from app.core.security import ActorContext
 from app.modules.entities.infrastructure.models import EntitySchemaModel
-from app.modules.objects.api.schemas import EntityObjectCreate, ObjectImportJobRead
+from app.modules.objects.api.schemas import (
+    EntityObjectCreate,
+    ObjectImportJobPage,
+    ObjectImportJobRead,
+)
 from app.modules.objects.application.service import RuntimeEntityNotFound, RuntimeValidationError
 from app.shared.db.models import ImportJobModel
 
@@ -153,6 +157,41 @@ class ObjectImportService:
         if job is None:
             raise RuntimeEntityNotFound
         return self.to_read_model(job)
+
+    async def list_page(
+        self,
+        *,
+        actor_id: UUID,
+        status: str | None,
+        limit: int,
+        offset: int,
+    ) -> ObjectImportJobPage:
+        """Вернуть текущему пользователю его фоновые импорты."""
+
+        conditions = [ImportJobModel.created_by == actor_id]
+        if status is not None:
+            conditions.append(ImportJobModel.status == status)
+        total = int(
+            await self._session.scalar(
+                select(func.count()).select_from(ImportJobModel).where(*conditions)
+            )
+            or 0
+        )
+        jobs = (
+            await self._session.scalars(
+                select(ImportJobModel)
+                .where(*conditions)
+                .order_by(ImportJobModel.created_at.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        ).all()
+        return ObjectImportJobPage(
+            items=[self.to_read_model(job) for job in jobs],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
 
     async def command(
         self,

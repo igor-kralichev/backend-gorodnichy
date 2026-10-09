@@ -74,9 +74,14 @@ class DictionaryModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_dictionaries_entity_active", "entity_schema_id", "active"),
     )
 
-    entity_schema_id: Mapped[UUID] = mapped_column(
-        PGUUID(as_uuid=True), ForeignKey("entity_schemas.id", ondelete="CASCADE"), nullable=False
+    entity_schema_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("entity_schemas.id", ondelete="CASCADE")
     )
+    scope: Mapped[str] = mapped_column(String(24), nullable=False, default="entity", server_default="entity")
+    owner_organization_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id", ondelete="RESTRICT")
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     code: Mapped[str] = mapped_column(String(120), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
@@ -290,6 +295,9 @@ class AttachmentModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     object_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("entity_objects.id", ondelete="CASCADE"), nullable=False
     )
+    entity_field_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("entity_fields.id", ondelete="SET NULL")
+    )
     kind: Mapped[str] = mapped_column(String(20), nullable=False)
     original_name: Mapped[str] = mapped_column(String(1024), nullable=False)
     object_key: Mapped[str] = mapped_column(String(1024), unique=True, nullable=False)
@@ -407,6 +415,9 @@ class ChangeSetItemModel(UUIDPrimaryKeyMixin, Base):
         PGUUID(as_uuid=True), ForeignKey("change_sets.id", ondelete="CASCADE"), nullable=False
     )
     object_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("entity_objects.id", ondelete="RESTRICT")
+    )
+    parent_object_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("entity_objects.id", ondelete="RESTRICT")
     )
     operation: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -683,6 +694,85 @@ class ImportRowModel(UUIDPrimaryKeyMixin, Base):
     raw_values: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
     normalized_values: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
     errors: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
+
+
+class ExcelExportJobModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Фоновая выгрузка XLSX, привязанная к автору и снимку параметров."""
+
+    __tablename__ = "excel_export_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('queued', 'running', 'completed', 'failed', 'cancelled')",
+            name="status",
+        ),
+        Index(
+            "ix_excel_export_jobs_owner_status_created",
+            "created_by",
+            "status",
+            "created_at",
+        ),
+        Index(
+            "ix_excel_export_jobs_entity_created",
+            "entity_schema_id",
+            "created_at",
+        ),
+    )
+
+    entity_schema_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("entity_schemas.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="queued", server_default="queued"
+    )
+    request_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    result_object_key: Mapped[str | None] = mapped_column(String(1024))
+    result_filename: Mapped[str | None] = mapped_column(String(1024))
+    total_rows: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ExcelImportPlanModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "excel_import_plans"
+
+    entity_schema_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("entity_schemas.id", ondelete="CASCADE"), nullable=False
+    )
+    schema_version_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("entity_schema_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_by: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="draft", server_default="draft")
+    source_name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    source_object_key: Mapped[str | None] = mapped_column(String(1024))
+    mapping: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    summary: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    rows: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
+    decisions: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class NotificationModel(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "notifications"
+
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    type: Mapped[str] = mapped_column(String(120), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    resource_type: Mapped[str | None] = mapped_column(String(80))
+    resource_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class AuditEventModel(UUIDPrimaryKeyMixin, Base):

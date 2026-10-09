@@ -9,6 +9,7 @@ from app.core.database import get_session
 from app.core.security import AdminActor, CurrentActor
 from app.modules.access.api.schemas import (
     DeleteRead,
+    EffectiveCapabilitiesRead,
     MembershipCreate,
     MembershipRead,
     MembershipUpdate,
@@ -26,9 +27,32 @@ from app.modules.access.application.service import (
     AccessManagementService,
     AccessResourceNotFound,
     SavedViewService,
+    AuthorizationService,
 )
 
 router = APIRouter(tags=["Организации и права"])
+
+
+@router.get(
+    "/me/capabilities",
+    response_model=EffectiveCapabilitiesRead,
+    response_model_by_alias=True,
+    summary="Получить эффективные возможности текущего пользователя",
+)
+async def get_current_capabilities(
+    actor: CurrentActor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    entity_code: Annotated[str | None, Query(alias="entityCode", max_length=120)] = None,
+    object_id: Annotated[UUID | None, Query(alias="objectId")] = None,
+) -> EffectiveCapabilitiesRead:
+    try:
+        return await AuthorizationService(session).capabilities(
+            actor,
+            entity_code=entity_code,
+            object_id=object_id,
+        )
+    except AccessResourceNotFound as error:
+        raise HTTPException(status_code=404, detail="Ресурс не найден") from error
 
 
 def _handle_access_error(error: Exception) -> None:

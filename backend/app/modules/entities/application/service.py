@@ -102,7 +102,12 @@ class CreateEntitySchemaService:
             suffix += 1
         return f"{base}_{suffix}"
 
-    async def validate_references(self, command: EntityCreate) -> None:
+    async def validate_references(
+        self,
+        command: EntityCreate,
+        *,
+        target_entity_id: UUID | None = None,
+    ) -> None:
         if command.scope_municipality_id is not None:
             municipality_id = await self._session.scalar(
                 select(MunicipalityModel.id).where(
@@ -141,21 +146,35 @@ class CreateEntitySchemaService:
             field.enum_id for field in command.fields if field.enum_id is not None
         }
         if dictionary_ids:
-            found_dictionary_ids = set(
+            dictionaries = list(
                 await self._session.scalars(
-                    select(DictionaryModel.id).where(
-                        DictionaryModel.id.in_(dictionary_ids)
+                    select(DictionaryModel).where(
+                        DictionaryModel.id.in_(dictionary_ids),
+                        DictionaryModel.active.is_(True),
                     )
                 )
             )
+            found_dictionary_ids = {item.id for item in dictionaries}
             missing_dictionary_ids = dictionary_ids - found_dictionary_ids
             if missing_dictionary_ids:
                 missing = ", ".join(
                     str(item) for item in sorted(missing_dictionary_ids, key=str)
                 )
                 raise EntityFieldReferenceError(
-                    f"Справочники из enumId не найдены: {missing}"
+                    f"Справочники из enumId не найдены или архивированы: {missing}"
                 )
+            for dictionary in dictionaries:
+                if dictionary.scope == "entity" and dictionary.entity_schema_id != target_entity_id:
+                    raise EntityFieldReferenceError(
+                        f"Справочник {dictionary.code} доступен только своей сущности"
+                    )
+                if (
+                    dictionary.scope == "organization"
+                    and dictionary.owner_organization_id != command.owner_organization_id
+                ):
+                    raise EntityFieldReferenceError(
+                        f"Справочник {dictionary.code} принадлежит другой организации"
+                    )
 
         entity_ids = {
             field.reference_entity_id
@@ -240,6 +259,7 @@ class CreateEntitySchemaService:
                 stroke_width=style.stroke_width,
                 point_size=style.point_size,
                 opacity=style.opacity,
+                marker_icon=style.marker_icon,
             )
             for geometry_type in (MapGeometryType.POINT, MapGeometryType.LINE_STRING, MapGeometryType.POLYGON)
             for style in [requested_styles.get(geometry_type, DEFAULT_STYLES[geometry_type])]
@@ -301,6 +321,8 @@ class CreateEntitySchemaService:
                     archived=field.archived,
                     access_rules=field.access,
                     formula=field.formula,
+                    unit_code=field.unit_code,
+                    decimal_scale=field.decimal_scale,
                 )
             )
         return result
@@ -332,6 +354,7 @@ class CreateEntitySchemaService:
                 stroke_width=float(style.stroke_width),
                 point_size=float(style.point_size),
                 opacity=float(style.opacity),
+                marker_icon=style.marker_icon,
             )
             for style in entity.map_styles
         }

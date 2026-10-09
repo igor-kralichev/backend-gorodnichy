@@ -152,6 +152,8 @@ class EntityFieldModel(UUIDPrimaryKeyMixin, Base):
     archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     access_rules: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
     formula: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    unit_code: Mapped[str | None] = mapped_column(String(64))
+    decimal_scale: Mapped[int | None] = mapped_column(Integer)
     dictionary_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("dictionaries.id", ondelete="RESTRICT")
     )
@@ -198,8 +200,24 @@ class EntityMapStyleModel(UUIDPrimaryKeyMixin, Base):
     stroke_width: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False)
     point_size: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False)
     opacity: Mapped[float] = mapped_column(Numeric(4, 3), nullable=False)
+    marker_icon: Mapped[str | None] = mapped_column(String(120))
 
     entity_schema: Mapped[EntitySchemaModel] = relationship(back_populates="map_styles")
+
+
+class EntitySchemaDraftModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "entity_schema_drafts"
+    __table_args__ = (
+        UniqueConstraint("entity_schema_id", name="uq_entity_schema_drafts_entity"),
+        CheckConstraint("base_version > 0", name="positive_base_version"),
+    )
+
+    entity_schema_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("entity_schemas.id", ondelete="CASCADE"), nullable=False
+    )
+    base_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    updated_by: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
 
 
 class EntityMapColorRuleModel(UUIDPrimaryKeyMixin, Base):

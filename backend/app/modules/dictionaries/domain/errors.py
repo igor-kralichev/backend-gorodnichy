@@ -12,3 +12,11 @@ class DictionaryEntityNotFound(DictionaryError):
 
 class DictionaryNotFound(DictionaryError):
     """Справочник не найден."""
+
+
+class DictionaryConflict(DictionaryError):
+    """Справочник изменён параллельно или содержит конфликтующее значение."""
+
+
+class DictionaryItemNotFound(DictionaryError):
+    """Элемент справочника не найден."""

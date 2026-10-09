@@ -13,7 +13,7 @@ Admin Console: <http://localhost:8080>. Локальные bootstrap-данны�
 
 ## Realm приложения
 
-При первом старте `import/municipal-low-code-realm.json` создаёт realm `municipal-low-code`, realm roles `Admin`/`User`, confidential client `municipal-api`, public PKCE client `municipal-spa` и service account backend. Файл является конфигурацией начального окружения, а не постоянным реестром пользователей.
+При первом старте `import/municipal-low-code-realm.json` создаёт realm `municipal-low-code`, realm roles `Admin`/`User`, глобальные роли `permission_*`, confidential client `municipal-api`, public PKCE client `municipal-spa` и service account backend. `Admin` является составной ролью и наследует все `permission_*`; backend не содержит отдельного обхода проверки прав по имени `Admin`. Файл является конфигурацией начального окружения, а не постоянным реестром пользователей.
 
 В импортируемом realm настроена следующая политика сессий и токенов:
 
@@ -24,6 +24,12 @@ Admin Console: <http://localhost:8080>. Локальные bootstrap-данны�
 - `Refresh Token Max Reuse` равен `0`: использованный refresh token повторно применять нельзя, при каждом refresh клиент обязан принять новый токен.
 
 Offline tokens для SPA не используются. `municipal-spa` остаётся public client с Authorization Code Flow + PKCE S256; implicit flow и Direct Access Grants не требуются.
+
+## Read-only API-ключи сущностей
+
+Backend представляет ключ сгенерированного API как secret отдельного confidential client `municipal-generated-<entityUuidWithoutDashes>`. Полное значение передаётся интеграции в заголовке `X-API-Key`; обычные пользовательские CRUD-операции этот заголовок не принимают.
+
+Создание, просмотр, ротация и удаление такого client выполняются только административными backend-ручками. Secret не записывается в аудит. Для этих операций service account `municipal-api` нужны строго контролируемые права Keycloak на generated clients. Realm-wide `manage-clients` даёт доступ ко всем clients realm и не должен назначаться автоматически без отдельного решения по модели безопасности. Для production предпочтительны Fine-Grained Admin Permissions или отдельный realm машинных интеграций.
 
 Импорт realm не перезаписывает уже существующий realm при каждом рестарте. Пользователей приложения создавайте в `municipal-low-code` через Admin Console или защищённые `/api/v1/users` backend. Для Swagger нужен пользователь этого realm; bootstrap-admin realm `master` там не авторизуется.
 

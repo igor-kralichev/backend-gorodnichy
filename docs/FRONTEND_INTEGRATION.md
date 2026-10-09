@@ -5,12 +5,13 @@
 ## 1. Общие правила клиента
 
 - Base URL локально: `http://localhost:8000`.
-- Все прикладные маршруты начинаются с `/api/v1` и требуют `Authorization: Bearer <accessToken>`.
+- Все прикладные маршруты начинаются с `/api/v1`. Обычный CRUD требует `Authorization: Bearer <accessToken>`. Только read-only маршруты `/api/v1/generated/{entityCode}/objects...` дополнительно принимают `X-API-Key`.
 - JSON-поля и параметры используют `camelCase`; уже существующие URL переименовывать не требуется.
 - Даты приходят в ISO 8601. Форматировать их для пользователя следует на frontend в выбранной временной зоне.
 - GeoJSON хранится в WGS 84 (`EPSG:4326`), координаты передаются в порядке `[longitude, latitude]`.
 - Для трассировки frontend может отправлять `X-Request-ID`; backend возвращает его в одноимённом заголовке и в теле ошибки.
 - При `401` клиент обновляет токен или отправляет пользователя на вход. `403` означает, что пользователь опознан, но не имеет права на операцию.
+- Realm-роль `Admin` в Keycloak включает составные глобальные роли `permission_*`, поэтому даёт полный доступ ко всем прикладным операциям, включая Excel. Backend не делает специального исключения для имени `Admin`: он проверяет полученные из JWT глобальные роли и предметные permission grants.
 
 Единый контракт ошибки:
 
@@ -34,6 +35,10 @@ SPA использует Authorization Code Flow с PKCE:
 3. Передавать access token во всех `/api/v1` запросах.
 4. Роли читать из `realm_access.roles`; backend всё равно повторно проверяет права.
 5. Временный пароль Keycloak потребует сменить при следующем входе автоматически.
+
+Access token клиента `municipal-spa` содержит audience `municipal-api`.
+Backend проверяет подпись, issuer, audience, срок действия и тип `Bearer`; ID token
+или access token другого API использовать для запросов нельзя.
 
 Не используйте `X-Actor-Id` и `X-Actor-Role`: пользователь, ФИО, email и роли берутся только из JWT.
 
@@ -104,6 +109,9 @@ WebSocket импорта открывается с актуальным access t
 4. При необходимости `GET /api/v1/saved-views` — восстановить пользовательские фильтры и колонки.
 
 Не кэшируйте динамическую схему навсегда: после публикации новой версии перечитайте сущность/каталог и перестройте форму.
+Каталог уже отфильтрован backend по effective permissions текущего пользователя:
+недоступные сущности и поля в него не попадают. Поэтому frontend не должен
+восстанавливать скрытые пункты меню из локального кэша или полного каталога Admin.
 
 ## 4. Сущности и публикация схемы
 
@@ -128,6 +136,19 @@ WebSocket импорта открывается с актуальным access t
 Поле объекта типа `enum` может получить UUID, `code` или название элемента. Backend сопоставляет значение со справочником, сохраняет стабильный `dictionaryItem.code`, а в `displayValues` возвращает название для UI. Пробелы по краям удаляются; регистр отображаемого названия не меняется.
 
 Для select-компонента используйте `items[].code` как value и `items[].name` как label. Архивные справочники по умолчанию не возвращаются; для страницы архива передайте `includeArchived=true`.
+
+Справочники бывают `global`, `organization` и `entity`. При запросе с
+`entityId` и `includeShared=true` backend добавляет доступные общие и
+организационные списки. Для редактирования используйте возвращённую `revision`:
+атомарные `POST/PATCH/DELETE .../items` отклоняют устаревшую ревизию как `409`.
+`capabilities` содержит `read` и, если разрешено, `manage`.
+
+Значения из XLSX загружаются в два шага:
+
+1. `POST /dictionaries/{dictionaryId}/excel/preview` с `file`, `sheetName`,
+   `headerRow`, `valueColumn` — показать new/existing/duplicate/empty.
+2. `POST /dictionaries/{dictionaryId}/excel/import` с теми же полями и
+   `revision` — выполнить merge без удаления прежних значений.
 
 ## 6. Объекты: единый CRUD
 
@@ -180,7 +201,7 @@ DELETE /api/v1/entities/{entityCode}/objects/{objectId}
 
 ### Изменение и конфликт редактирования
 
-Передавайте в `PATCH` последнюю `revision`. При `409` не перезаписывайте данные молча: перечитайте карточку, покажите различия и предложите повторить изменение. `values` в PATCH содержит только изменяемые динамические поля.
+В `PATCH` поле `revision` обязательно. При `409` не перезаписывайте данные молча: перечитайте карточку, покажите различия и предложите повторить изменение. `values` в PATCH содержит только изменяемые динамические поля; `readOnly`, архивные и запрещённые ролью поля backend отклоняет с `422`.
 
 ### Геометрия
 
@@ -192,6 +213,16 @@ DELETE /api/v1/entities/{entityCode}/objects/{objectId}
 
 Операторы: `equals`, `notEquals`, `contains`, `startsWith`, `endsWith`, `greaterThan`, `greaterOrEqual`, `lessThan`, `lessOrEqual`, `in`, `notIn`, `filled`, `empty`, `today`, `beforeToday`, `afterToday`.
 
+Backend применяет тип поля из схемы: числа, boolean, date и datetime сравниваются как типы PostgreSQL, а не как строки. `datetime` требует ISO 8601 с `Z` или смещением часового пояса и сохраняется в UTC. Для `multiple=true` операторы работают по отдельным элементам JSON-массива; сортировка множественного поля запрещена.
+
+Один уровень связанного фильтра задаётся через точку: `school.district`. Для поля родительского объекта дочерней сущности используйте `parent.count`. При пользовательской JWT-авторизации backend проверяет право чтения связанной сущности.
+
+### Реестр вместе с подреестрами
+
+`POST /api/v1/entities/{entityCode}/objects/queryTree` возвращает выбранные колонки родителя и непосредственных подреестров. В теле передаются `columns`, `filters`, `sort`, пагинация и массив `children`; у каждого child свои `entityCode`, `columns`, `filters`, `sort`, `limitPerParent`. Пустой `columns` означает поля `listVisible`.
+
+Дочерние записи находятся в `data[].children[childEntityCode]`, поэтому frontend не должен самостоятельно выполнять N+1 запрос на каждого родителя. Полный пример находится в [GENERATED_API_FILTERING.md](GENERATED_API_FILTERING.md).
+
 Для карты на небольшом масштабе используйте `/clusters` с `bbox` и `zoom`; после приближения запрашивайте обычные объекты по bbox.
 
 ## 7. Фоновые импорты
@@ -199,6 +230,7 @@ DELETE /api/v1/entities/{entityCode}/objects/{objectId}
 Job имеет статусы `queued`, `running`, `paused`, `completed`, `failed`, `cancelled` и счётчики `totalRows`, `processedRows`, `errorRows`.
 
 ```text
+GET  /api/v1/importJobs
 GET  /api/v1/importJobs/{jobId}
 POST /api/v1/importJobs/{jobId}/command   {"command":"pause|resume|cancel"}
 WS   /api/v1/importJobs/{jobId}/ws?token=ACCESS_TOKEN
@@ -209,6 +241,8 @@ WS   /api/v1/importJobs/{jobId}/ws?token=ACCESS_TOKEN
 ## 8. Excel
 
 Все Excel-ручки работают только с `.xlsx` без макросов.
+
+Для импорта нужен предметный grant с действием `import` либо глобальная realm-роль `permission_import`, для экспорта — grant `export` либо роль `permission_export`. Составная роль `Admin` наследует оба права в Keycloak. После изменения ролей необходимо обновить access token либо войти повторно, потому что роли зафиксированы внутри JWT.
 
 ### Предпросмотр
 
@@ -230,9 +264,74 @@ WS   /api/v1/importJobs/{jobId}/ws?token=ACCESS_TOKEN
 
 ### Экспорт и повторный импорт
 
-`GET /api/v1/entities/{entityCode}/excel/export` скачивает XLSX. В первой технической строке находятся `__objectId`, `__revision`, `__schemaVersionId`, `__action` и UUID полей, во второй — пользовательские заголовки, данные начинаются с третьей строки. Не удаляйте техническую строку при повторной загрузке: она нужна для изменения существующих объектов и защиты от конфликтов.
+`GET /api/v1/entities/{entityCode}/excel/export` скачивает пользовательский XLSX без технической строки с UUID полей. Первая строка содержит понятные названия колонок, данные начинаются со второй строки. Для последующего импорта frontend передаёт отдельный JSON `mapping`, связывающий заголовки Excel с кодами полей сущности; backend не ожидает служебных метаданных внутри выгрузки.
+
+Синхронный экспорт ограничен 50 000 строками. Если число доступных
+пользователю строк превышает этот лимит, backend возвращает `422`, а не
+неполный файл. Строки с началом `+`, `-`, `=` и `@` остаются исходным текстом
+после скачивания и повторного чтения XLSX.
+
+`POST /api/v1/entities/{entityCode}/excel/exportSelection` принимает контракт
+`queryTree` и выгружает выбранные колонки с учётом фильтров. Для явного выбора
+передайте `selectionMode=ids` и `objectIds`; для выборки по фильтру —
+`selectionMode=filter`, фильтры и при необходимости `excludedIds`. Родитель
+находится на первом листе; каждый подреестр — на отдельном листе с выбранными
+колонками родителя. UUID/revision/schemaVersion в книгу для человека не
+добавляются.
+
+Для больших выборок используйте фоновый экспорт:
+
+```text
+POST /api/v1/entities/{entityCode}/excel/exportJobs
+GET  /api/v1/excel/exportJobs?status=queued|running|completed|failed|cancelled
+GET  /api/v1/excel/exportJobs/{jobId}
+POST /api/v1/excel/exportJobs/{jobId}/command   {"command":"cancel"}
+GET  /api/v1/excel/exportJobs/{jobId}/download
+```
+
+POST принимает тот же выбор колонок, фильтров, `selectionMode`, `objectIds`,
+`excludedIds` и подреестров. Ответ `202` содержит job. Опрос можно прекратить
+при `completed|failed|cancelled`; при `completed` используйте `downloadUrl`.
+Фоновый предел по умолчанию — 500 000 суммарных строк реестра и подреестров,
+файл доступен автору задачи 24 часа. Результат формирует export-worker через
+RabbitMQ и хранит в MinIO; прямой доступ к бакету frontend не нужен.
+Параметры выборки фиксируются в job, а данные читаются в момент начала работы worker.
+
+`mapping.system` отделён от динамических полей и поддерживает родителя,
+координаты/GeoJSON и идентификатор существующего объекта:
+
+```json
+{
+  "sheetName": "Лист1",
+  "headerRow": 1,
+  "columns": {"Название": "name", "Адрес": "address"},
+  "system": {
+    "fixedParentObjectId": null,
+    "parentObjectColumn": "ID родителя",
+    "objectIdColumn": "ID объекта",
+    "actionColumn": "Действие",
+    "longitudeColumn": "Долгота",
+    "latitudeColumn": "Широта"
+  }
+}
+```
+
+Для подтверждаемого импорта используйте `POST
+/entities/{entityCode}/excel/plans`, затем пагинированный `GET
+/excel/plans/{planId}`. Он возвращает `base/file/current`, состояние строки и
+ошибки. `POST /excel/plans/{planId}/decision` принимает `apply/reject/cancel`;
+при конкурентном изменении передайте `resolutions` с ключом
+`rowIndex.fieldCode` и значением `file|current`. План действует 24 часа.
 
 Геометрии и бинарные файлы в текущий XLSX-экспорт не входят.
+
+## 8.1. Сгенерированный API и X-API-Key
+
+Read-only интеграционные маршруты находятся под `/api/v1/generated/{entityCode}/objects`. Они поддерживают список, сложный search, карточку и `queryTree`. Изменяющие операции остаются только под `/api/v1/entities/...` и всегда требуют пользовательский JWT.
+
+Администратор управляет ключом через `POST/GET /generated/apiKeys/{entityCode}`, `POST .../rotate` и `DELETE`. GET намеренно показывает полное значение только роли `Admin`. Административный UI должен скрывать ключ по умолчанию, давать явную кнопку «Показать/скопировать» и не логировать ответ.
+
+Не передавайте `X-API-Key` из публичной Vue SPA. Он предназначен для серверной интеграции; браузерный интерфейс продолжает использовать Bearer JWT Keycloak.
 
 ### Профили импорта
 
@@ -246,7 +345,7 @@ ChangeSet — атомарная группа команд, а не отдель
 2. `GET /api/v1/changeSets/{changeSetId}` показывает проверку каждой строки.
 3. `POST /api/v1/changeSets/{changeSetId}/decision` с `apply`, `reject` или `cancel`.
 
-Операции элемента: `create`, `update`, `archive`, `confirm`. Для update обязательны `objectId` и `baseRevision`. Применение атомарно: конфликт не должен оставлять частично записанный пакет. Повтор того же `idempotencyKey` безопасен; другой payload с тем же ключом возвращает `409`.
+Операции элемента: `create`, `update`, `archive`, `confirm`. Для update обязательны `objectId` и `baseRevision`. Применение атомарно: конфликт не должен оставлять частично записанный пакет. Backend повторно сверяет текущую версию схемы и валидирует значения при apply; при `409` из-за новой версии схемы нужно заново подготовить ChangeSet. Неизменившийся update не увеличивает ревизию объекта. Повтор того же `idempotencyKey` безопасен; другой payload с тем же ключом возвращает `409`.
 
 ## 10. Файлы объекта
 
@@ -308,6 +407,21 @@ ChangeSet — атомарная группа команд, а не отдель
 
 - `GET /api/v1/search/objectSuggestions?q=...` — быстрые подсказки по объектам; дополнительно доступны `entityCode`, `fieldCode`, `limit`.
 - `GET /api/v1/geocoding/addressSuggestions?q=...&source=dadata|nominatim` — адресные подсказки через backend. Минимум три символа, ключи DaData в браузер не передаются.
+- `GET /api/v1/geocoding/reverse?longitude=...&latitude=...` — адрес точки.
+- `GET /api/v1/geocoding/buildings?bbox=minLon,minLat,maxLon,maxLat` — контуры зданий; не запрашивайте большую область.
+
+## 13. Capabilities, черновик схемы, уведомления и история
+
+- `GET /api/v1/me/capabilities?entityCode=...&objectId=...` — единственный
+  источник доступности кнопок и полей; frontend не вычисляет права по имени
+  realm-role.
+- Для active-схемы сначала `GET /entities/{identifier}/draft`, затем
+  `PATCH /draft` с `expectedVersion`; перед публикацией вызовите
+  `POST /draft/validation`, после подтверждения — `POST /draft/publish`.
+- `GET /notifications`, `PATCH /notifications/{notificationId}` и
+  `POST /notifications/readAll` обслуживают bell текущего пользователя.
+- `GET /audit/resources/{resourceType}/{resourceId}` отдаёт разрешённую историю
+  ресурса; недоступные значения полей backend не возвращает.
 
 Для выбора адреса сохраняйте структурированный результат провайдера, но разрешайте пользователю подтвердить/исправить значение. Геокодирование не должно блокировать сохранение неполной записи: такая запись остаётся черновиком с ошибками качества.
 
@@ -335,17 +449,28 @@ POST              /api/v1/entities/{identifier}/publish
 POST              /api/v1/entities/{identifier}/archive
 POST              /api/v1/entities/{identifier}/restore
 POST              /api/v1/entities/{identifier}/duplicate
+GET,PATCH         /api/v1/entities/{identifier}/draft
+POST              /api/v1/entities/{identifier}/draft/validation
+POST              /api/v1/entities/{identifier}/draft/publish
+GET               /api/v1/metadata/units
+GET               /api/v1/metadata/markerIcons
 
 # Справочники
 GET,POST          /api/v1/dictionaries
 GET,PATCH,DELETE  /api/v1/dictionaries/{dictionaryId}
 POST              /api/v1/dictionaries/{dictionaryId}/archive
 POST              /api/v1/dictionaries/{dictionaryId}/restore
+POST              /api/v1/dictionaries/{dictionaryId}/items
+PATCH,DELETE      /api/v1/dictionaries/{dictionaryId}/items/{itemId}
+POST              /api/v1/dictionaries/{dictionaryId}/excel/preview
+POST              /api/v1/dictionaries/{dictionaryId}/excel/import
 
 # Объекты и карта
 GET,POST          /api/v1/entities/{entityCode}/objects
 POST              /api/v1/entities/{entityCode}/objects/search
 GET               /api/v1/entities/{entityCode}/objects/clusters
+POST              /api/v1/entities/{entityCode}/objects/clusters/search
+POST              /api/v1/entities/{entityCode}/objects/queryTree
 GET,PATCH,DELETE  /api/v1/entities/{entityCode}/objects/{objectId}
 POST              /api/v1/entities/{entityCode}/objects/{objectId}/copy
 POST              /api/v1/entities/{entityCode}/objects/{objectId}/archive
@@ -363,8 +488,18 @@ GET               /api/v1/entities/{entityCode}/objects/{objectId}/attachments/{
 POST              /api/v1/entities/{entityCode}/excel/preview
 POST              /api/v1/entities/{entityCode}/excel/import
 GET               /api/v1/entities/{entityCode}/excel/export
+POST              /api/v1/entities/{entityCode}/excel/exportSelection
+POST              /api/v1/entities/{entityCode}/excel/exportJobs
+GET               /api/v1/excel/exportJobs
+GET               /api/v1/excel/exportJobs/{jobId}
+POST              /api/v1/excel/exportJobs/{jobId}/command
+GET               /api/v1/excel/exportJobs/{jobId}/download
+POST              /api/v1/entities/{entityCode}/excel/plans
+GET               /api/v1/excel/plans/{planId}
+POST              /api/v1/excel/plans/{planId}/decision
 GET,POST          /api/v1/importProfiles
 DELETE            /api/v1/importProfiles/{profileId}
+GET               /api/v1/importJobs
 GET               /api/v1/importJobs/{jobId}
 POST              /api/v1/importJobs/{jobId}/command
 WS                /api/v1/importJobs/{jobId}/ws
@@ -375,6 +510,7 @@ GET               /api/v1/changeSets/{changeSetId}
 POST              /api/v1/changeSets/{changeSetId}/decision
 
 # Организации и права
+GET               /api/v1/me/capabilities
 GET,POST          /api/v1/organizations
 PATCH             /api/v1/organizations/{organizationId}
 POST              /api/v1/memberships
@@ -417,10 +553,16 @@ POST              /api/v1/users/{userId}/deactivate
 POST              /api/v1/users/{userId}/resetPassword
 DELETE            /api/v1/users/{userId}
 GET               /api/v1/audit/events
+GET               /api/v1/audit/resources/{resourceType}/{resourceId}
+GET               /api/v1/notifications
+PATCH             /api/v1/notifications/{notificationId}
+POST              /api/v1/notifications/readAll
 
 # Поиск, геокодирование и dynamic API
 GET               /api/v1/search/objectSuggestions
 GET               /api/v1/geocoding/addressSuggestions
+GET               /api/v1/geocoding/reverse
+GET               /api/v1/geocoding/buildings
 GET               /api/v1/generated/catalog
 GET               /api/v1/generated/catalog/{entityCode}
 GET               /api/v1/openapi.json

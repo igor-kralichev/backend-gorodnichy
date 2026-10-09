@@ -10,6 +10,9 @@ from app.modules.entities.api.schemas import (
     EntityCreate,
     EntityDeleteRead,
     EntityDuplicateCreate,
+    EntityDraftPatch,
+    EntityDraftRead,
+    EntityDraftValidationRead,
     EntityFieldCreate,
     EntityListRead,
     EntityRead,
@@ -22,7 +25,11 @@ from app.modules.entities.api.schemas import (
 )
 from app.modules.entities.application.service import CreateEntitySchemaService
 from app.modules.entities.domain.enums import EntityStatus, FieldType, GeometryType, MapGeometryType
-from app.modules.entities.domain.errors import EntitySchemaConflict, EntitySchemaNotFound
+from app.modules.entities.domain.errors import (
+    EntitySchemaConflict,
+    EntitySchemaError,
+    EntitySchemaNotFound,
+)
 from app.modules.entities.infrastructure.models import (
     EntityAllowedGeometryTypeModel,
     EntityFieldModel,
@@ -30,13 +37,16 @@ from app.modules.entities.infrastructure.models import (
     EntityMapColorRuleModel,
     EntityMapStyleModel,
     EntitySchemaModel,
+    EntitySchemaDraftModel,
     EntitySchemaVersionModel,
 )
 from app.shared.db.models import (
     AttachmentModel,
     DictionaryItemModel,
     DictionaryModel,
+    EntityRelationModel,
     EntityObjectModel,
+    FormDefinitionModel,
     ImportJobModel,
     ImportRowModel,
     ObjectEventModel,
@@ -57,6 +67,8 @@ class EntitySchemaManagementService:
         *,
         status_filter: EntityStatus | None,
         include_archived: bool,
+        query: str | None,
+        sort: str,
         limit: int,
         offset: int,
     ) -> EntityListRead:
@@ -65,6 +77,23 @@ class EntitySchemaManagementService:
             conditions.append(EntitySchemaModel.status == status_filter.value)
         elif not include_archived:
             conditions.append(EntitySchemaModel.status != EntityStatus.ARCHIVED.value)
+        if query:
+            pattern = f"%{query.strip()}%"
+            conditions.append(
+                or_(
+                    EntitySchemaModel.name.ilike(pattern),
+                    EntitySchemaModel.code.ilike(pattern),
+                    EntitySchemaModel.description.ilike(pattern),
+                )
+            )
+        sort_expressions = {
+            "name": EntitySchemaModel.name.asc(),
+            "-name": EntitySchemaModel.name.desc(),
+            "updatedAt": EntitySchemaModel.updated_at.asc(),
+            "-updatedAt": EntitySchemaModel.updated_at.desc(),
+            "createdAt": EntitySchemaModel.created_at.asc(),
+            "-createdAt": EntitySchemaModel.created_at.desc(),
+        }
 
         total = int(
             await self._session.scalar(
@@ -78,7 +107,7 @@ class EntitySchemaManagementService:
             await self._session.scalars(
                 select(EntitySchemaModel)
                 .where(*conditions)
-                .order_by(EntitySchemaModel.updated_at.desc())
+                .order_by(sort_expressions[sort])
                 .offset(offset)
                 .limit(limit)
             )
@@ -110,9 +139,13 @@ class EntitySchemaManagementService:
                 raise EntitySchemaConflict(
                     "Архивную сущность необходимо сначала восстановить"
                 )
+            if entity.status == EntityStatus.ACTIVE.value:
+                raise EntitySchemaConflict(
+                    "Активную схему изменяют через отдельный draft с последующей публикацией"
+                )
 
             command = self._merge_command(entity, payload)
-            await self._builder.validate_references(command)
+            await self._builder.validate_references(command, target_entity_id=entity.id)
             await self._ensure_valid_parent_entity(entity.id, command.parent_entity_id)
             code = command.code or entity.code
             if code != entity.code:
@@ -151,6 +184,191 @@ class EntitySchemaManagementService:
         await self._invalidate_cache(entity_id, previous_version)
         await self._builder.cache_schema(response)
         return response
+
+    async def get_or_create_draft(
+        self,
+        identifier: str,
+        actor_id: UUID,
+    ) -> EntityDraftRead:
+        async with self._session.begin():
+            entity = await self._find(identifier, for_update=True)
+            if entity.status == EntityStatus.ARCHIVED.value:
+                raise EntitySchemaConflict("Для архивной сущности нельзя создать черновик")
+            draft = await self._session.scalar(
+                select(EntitySchemaDraftModel).where(
+                    EntitySchemaDraftModel.entity_schema_id == entity.id
+                )
+            )
+            if draft is None:
+                draft = EntitySchemaDraftModel(
+                    entity_schema_id=entity.id,
+                    base_version=entity.current_version,
+                    snapshot=self._to_command(entity).model_dump(mode="json", by_alias=True),
+                    updated_by=actor_id,
+                )
+                self._session.add(draft)
+                await self._session.flush()
+                await self._session.refresh(draft)
+        return self._draft_response(draft)
+
+    async def update_draft(
+        self,
+        identifier: str,
+        payload: EntityDraftPatch,
+        actor_id: UUID,
+    ) -> EntityDraftRead:
+        async with self._session.begin():
+            entity = await self._find(identifier, for_update=True)
+            draft = await self._session.scalar(
+                select(EntitySchemaDraftModel)
+                .where(EntitySchemaDraftModel.entity_schema_id == entity.id)
+                .with_for_update()
+            )
+            if draft is None:
+                raise EntitySchemaConflict("Сначала получите черновик сущности")
+            if (
+                draft.base_version != payload.expected_version
+                or entity.current_version != payload.expected_version
+            ):
+                raise EntitySchemaConflict("Active-схема изменилась; создайте новый черновик")
+            command = EntityCreate.model_validate(draft.snapshot)
+            changes = {
+                name: getattr(payload.changes, name)
+                for name in payload.changes.model_fields_set
+            }
+            command = EntityCreate.model_validate(
+                command.model_copy(update=changes).model_dump(mode="python")
+            )
+            await self._builder.validate_references(command, target_entity_id=entity.id)
+            await self._ensure_valid_parent_entity(entity.id, command.parent_entity_id)
+            draft.snapshot = command.model_dump(mode="json", by_alias=True)
+            draft.updated_by = actor_id
+            await self._session.flush()
+            await self._session.refresh(draft, attribute_names=["updated_at"])
+        return self._draft_response(draft)
+
+    async def validate_draft(self, identifier: str) -> EntityDraftValidationRead:
+        entity = await self._find(identifier)
+        draft = await self._session.scalar(
+            select(EntitySchemaDraftModel).where(
+                EntitySchemaDraftModel.entity_schema_id == entity.id
+            )
+        )
+        if draft is None:
+            raise EntitySchemaConflict("Черновик сущности не найден")
+        issues: list[str] = []
+        command = EntityCreate.model_validate(draft.snapshot)
+        prototype = self._builder.build_entity(command, command.code or entity.code)
+        try:
+            await self._builder.validate_references(command, target_entity_id=entity.id)
+            await self._ensure_valid_parent_entity(entity.id, command.parent_entity_id)
+            await self._check_safe_schema_change(entity, prototype)
+        except (EntitySchemaError, ValueError) as error:
+            issues.append(str(error))
+        object_count = int(
+            await self._session.scalar(
+                select(func.count()).select_from(EntityObjectModel).where(
+                    EntityObjectModel.entity_schema_id == entity.id
+                )
+            )
+            or 0
+        )
+        relation_count = int(
+            await self._session.scalar(
+                select(func.count()).select_from(EntityRelationModel).where(
+                    or_(
+                        EntityRelationModel.source_entity_schema_id == entity.id,
+                        EntityRelationModel.target_entity_schema_id == entity.id,
+                    )
+                )
+            )
+            or 0
+        )
+        form_count = int(
+            await self._session.scalar(
+                select(func.count()).select_from(FormDefinitionModel).where(
+                    FormDefinitionModel.entity_schema_id == entity.id
+                )
+            )
+            or 0
+        )
+        old_fields = {field.code: field.field_type for field in entity.fields}
+        new_fields = {field.code: field.field_type for field in prototype.fields}
+        return EntityDraftValidationRead(
+            valid=not issues,
+            issues=issues,
+            impact={
+                "objects": object_count,
+                "relations": relation_count,
+                "forms": form_count,
+                "addedFields": len(set(new_fields) - set(old_fields)),
+                "removedFields": len(set(old_fields) - set(new_fields)),
+                "changedFieldTypes": sum(
+                    old_fields[code] != new_fields[code]
+                    for code in set(old_fields) & set(new_fields)
+                ),
+            },
+        )
+
+    async def publish_draft(
+        self,
+        identifier: str,
+        expected_version: int,
+        actor_id: UUID,
+    ) -> EntityRead:
+        entity_id: UUID | None = None
+        async with self._session.begin():
+            entity = await self._find(identifier, for_update=True)
+            draft = await self._session.scalar(
+                select(EntitySchemaDraftModel)
+                .where(EntitySchemaDraftModel.entity_schema_id == entity.id)
+                .with_for_update()
+            )
+            if draft is None:
+                raise EntitySchemaConflict("Черновик сущности не найден")
+            if draft.base_version != expected_version or entity.current_version != expected_version:
+                raise EntitySchemaConflict("Active-схема изменилась; публикация отменена")
+            command = EntityCreate.model_validate(draft.snapshot)
+            await self._builder.validate_references(command, target_entity_id=entity.id)
+            await self._ensure_valid_parent_entity(entity.id, command.parent_entity_id)
+            prototype = self._builder.build_entity(command, command.code or entity.code)
+            await self._check_safe_schema_change(entity, prototype)
+            previous_version = entity.current_version
+            await self._apply_prototype(entity, prototype, command)
+            entity.current_version += 1
+            if entity.status == EntityStatus.ACTIVE.value:
+                self._sync_layer(entity)
+            self._session.add(
+                EntitySchemaVersionModel(
+                    entity_schema_id=entity.id,
+                    version=entity.current_version,
+                    snapshot=self._builder.snapshot(entity),
+                    created_by=actor_id,
+                )
+            )
+            await self._session.delete(draft)
+            self._add_outbox(
+                entity,
+                "entity_schema.draft_published.v1",
+                actor_id,
+                {"previousVersion": previous_version},
+            )
+            await self._session.flush()
+            entity_id = entity.id
+            response = self._builder.to_response(entity)
+        await self._invalidate_cache(entity_id, expected_version)
+        await self._builder.cache_schema(response)
+        return response
+
+    @staticmethod
+    def _draft_response(draft: EntitySchemaDraftModel) -> EntityDraftRead:
+        return EntityDraftRead(
+            id=draft.id,
+            entity_id=draft.entity_schema_id,
+            base_version=draft.base_version,
+            draft_schema=EntityCreate.model_validate(draft.snapshot),
+            updated_at=draft.updated_at,
+        )
 
     async def publish(self, identifier: str, actor_id: UUID) -> EntityRead:
         previous_version = 0
@@ -531,6 +749,7 @@ class EntitySchemaManagementService:
                 stroke_width=float(style.stroke_width),
                 point_size=float(style.point_size),
                 opacity=float(style.opacity),
+                marker_icon=style.marker_icon,
             )
             for style in entity.map_styles
         }
@@ -570,6 +789,8 @@ class EntitySchemaManagementService:
                     archived=field.archived,
                     access=field.access_rules,
                     formula=field.formula,
+                    unit_code=field.unit_code,
+                    decimal_scale=field.decimal_scale,
                 )
                 for field in sorted(entity.fields, key=lambda item: item.sort_order)
             ],
@@ -693,6 +914,8 @@ class EntitySchemaManagementService:
             applied_field.archived = desired_field.archived
             applied_field.access_rules = desired_field.access_rules
             applied_field.formula = desired_field.formula
+            applied_field.unit_code = desired_field.unit_code
+            applied_field.decimal_scale = desired_field.decimal_scale
             applied_fields.append(applied_field)
         entity.fields = applied_fields
 
@@ -719,6 +942,7 @@ class EntitySchemaManagementService:
             applied_style.stroke_width = desired_style.stroke_width
             applied_style.point_size = desired_style.point_size
             applied_style.opacity = desired_style.opacity
+            applied_style.marker_icon = desired_style.marker_icon
 
         fields_by_code = {field.code: field for field in entity.fields}
         entity.color_rules = [

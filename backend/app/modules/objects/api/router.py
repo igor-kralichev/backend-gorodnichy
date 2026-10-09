@@ -30,8 +30,12 @@ from app.modules.objects.api.schemas import (
     EntityObjectStatusRead,
     ObjectFilter,
     ObjectClusterPage,
+    ObjectClusterSearch,
     ObjectImportJobRead,
     ObjectSearch,
+    ObjectStatusScope,
+    RegistryTreePage,
+    RegistryTreeSearch,
 )
 from app.modules.objects.application.imports import ObjectImportService
 from app.modules.objects.application.service import (
@@ -84,6 +88,14 @@ async def list_entity_objects(
         UUID | None,
         Query(alias="parentObjectId", description="Показать только вложенные объекты указанного родителя"),
     ] = None,
+    q: Annotated[
+        str | None,
+        Query(min_length=1, max_length=300, description="Поиск по searchable-полям"),
+    ] = None,
+    status_scope: Annotated[
+        ObjectStatusScope,
+        Query(alias="status", description="current, archived или all"),
+    ] = ObjectStatusScope.CURRENT,
     logic: Literal["and", "or"] = Query(
         default="and",
         description="Логика объединения фильтров",
@@ -107,11 +119,14 @@ async def list_entity_objects(
 ) -> EntityObjectPage:
     await _authorize(session, actor, "read", entity_code)
     filters = _query_filters(request)
+    await _authorize_filter_dependencies(session, actor, entity_code, filters)
     return await _execute(
         RuntimeObjectService(session).list_page(
             entity_code,
             ObjectSearch(
                 logic=logic,
+                q=q,
+                status=status_scope,
                 filters=filters,
                 sort=sort,
                 parent_object_id=parent_object_id,
@@ -119,6 +134,7 @@ async def list_entity_objects(
                 limit=limit,
                 offset=offset,
             ),
+            actor=actor,
         )
     )
 
@@ -133,12 +149,58 @@ async def list_entity_object_clusters(
     entity_code: EntityCode,
     bbox: Annotated[str, Query(description="minLon,minLat,maxLon,maxLat")],
     zoom: Annotated[int, Query(ge=0, le=24)],
+    request: Request,
+    actor: CurrentActor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    q: Annotated[str | None, Query(min_length=1, max_length=300)] = None,
+    status_scope: Annotated[ObjectStatusScope, Query(alias="status")] = ObjectStatusScope.CURRENT,
+    parent_object_id: Annotated[UUID | None, Query(alias="parentObjectId")] = None,
+    logic: Literal["and", "or"] = "and",
+) -> ObjectClusterPage:
+    filters = _query_filters(request)
+    await _authorize(session, actor, "read", entity_code)
+    await _authorize_filter_dependencies(session, actor, entity_code, filters)
+    return await _execute(
+        RuntimeObjectService(session).list_clusters(
+            entity_code,
+            _parse_bbox(bbox),
+            zoom,
+            actor=actor,
+            q=q,
+            status=status_scope,
+            parent_object_id=parent_object_id,
+            logic=logic,
+            filters=filters,
+        )
+    )
+
+
+@router.post(
+    "/{entityCode}/objects/clusters/search",
+    response_model=ObjectClusterPage,
+    response_model_by_alias=True,
+    summary="Получить кластеры по тем же фильтрам, что и таблица",
+)
+async def search_entity_object_clusters(
+    entity_code: EntityCode,
+    payload: ObjectClusterSearch,
     actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> ObjectClusterPage:
     await _authorize(session, actor, "read", entity_code)
+    await _authorize_filter_dependencies(session, actor, entity_code, payload.filters)
     return await _execute(
-        RuntimeObjectService(session).list_clusters(entity_code, _parse_bbox(bbox), zoom)
+        RuntimeObjectService(session).list_clusters(
+            entity_code,
+            payload.bbox,
+            payload.zoom,
+            actor=actor,
+            q=payload.q,
+            status=payload.status,
+            parent_object_id=payload.parent_object_id,
+            logic=payload.logic,
+            filters=payload.filters,
+        )
     )
 
 
@@ -159,7 +221,42 @@ async def search_entity_objects(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> EntityObjectPage:
     await _authorize(session, actor, "read", entity_code)
-    return await _execute(RuntimeObjectService(session).list_page(entity_code, payload))
+    await _authorize_filter_dependencies(session, actor, entity_code, payload.filters)
+    return await _execute(
+        RuntimeObjectService(session).list_page(entity_code, payload, actor=actor)
+    )
+
+
+@router.post(
+    "/{entityCode}/objects/queryTree",
+    response_model=RegistryTreePage,
+    response_model_by_alias=True,
+    summary="Получить реестр вместе с подреестрами",
+    description=(
+        "Возвращает выбранные колонки родительского реестра и непосредственных "
+        "подреестров. Фильтры и сортировка задаются отдельно для каждой сущности; "
+        "дочерние строки группируются по parentObjectId без размножения родителей."
+    ),
+)
+async def query_entity_tree(
+    entity_code: EntityCode,
+    payload: RegistryTreeSearch,
+    actor: CurrentActor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> RegistryTreePage:
+    await _authorize(session, actor, "read", entity_code)
+    await _authorize_filter_dependencies(session, actor, entity_code, payload.filters)
+    for child in payload.children:
+        await _authorize(session, actor, "read", child.entity_code)
+        await _authorize_filter_dependencies(
+            session,
+            actor,
+            child.entity_code,
+            child.filters,
+        )
+    return await _execute(
+        RuntimeObjectService(session).list_tree(entity_code, payload, actor=actor)
+    )
 
 
 @router.get(
@@ -175,7 +272,13 @@ async def get_entity_object(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> EntityObjectRead:
     await _authorize(session, actor, "read", entity_code, object_id)
-    return await _execute(RuntimeObjectService(session).get(entity_code, object_id))
+    return await _execute(
+        RuntimeObjectService(session).get(
+            entity_code,
+            object_id,
+            actor_roles=actor.roles,
+        )
+    )
 
 
 @router.post(
@@ -239,7 +342,14 @@ async def create_entity_object(
             content=job.model_dump(mode="json", by_alias=True),
         )
 
-    response = await _execute(RuntimeObjectService(session).create_many(entity_code, payload, actor.id))
+    response = await _execute(
+        RuntimeObjectService(session).create_many(
+            entity_code,
+            payload,
+            actor.id,
+            actor_roles=actor.roles,
+        )
+    )
     audit = AuditService(session)
     for item in response.data:
         await audit.record(
@@ -279,9 +389,19 @@ async def update_entity_object(
 ) -> EntityObjectRead:
     await _authorize(session, actor, "update", entity_code, object_id)
     service = RuntimeObjectService(session)
-    before = await _execute(service.get(entity_code, object_id))
+    before = await _execute(
+        service.get(entity_code, object_id, actor_roles=actor.roles)
+    )
     await session.rollback()
-    response = await _execute(service.update(entity_code, object_id, payload, actor.id))
+    response = await _execute(
+        service.update(
+            entity_code,
+            object_id,
+            payload,
+            actor.id,
+            actor_roles=actor.roles,
+        )
+    )
     await AuditService(session).record(
         actor=actor,
         resource_type="entity_object",
@@ -315,7 +435,12 @@ async def copy_entity_object(
     await _authorize(session, actor, "read", entity_code, object_id)
     await _authorize(session, actor, "create", entity_code)
     response = await _execute(
-        RuntimeObjectService(session).copy(entity_code, object_id, actor.id)
+        RuntimeObjectService(session).copy(
+            entity_code,
+            object_id,
+            actor.id,
+            actor_roles=actor.roles,
+        )
     )
     await AuditService(session).record(
         actor=actor,
@@ -349,7 +474,9 @@ async def archive_entity_object(
 ) -> EntityObjectStatusRead:
     await _authorize(session, actor, "archive", entity_code, object_id)
     service = RuntimeObjectService(session)
-    before = await _execute(service.get(entity_code, object_id))
+    before = await _execute(
+        service.get(entity_code, object_id, actor_roles=actor.roles)
+    )
     await session.rollback()
     response = await _execute(service.archive(entity_code, object_id, actor.id))
     await AuditService(session).record(
@@ -383,7 +510,9 @@ async def restore_entity_object(
 ) -> EntityObjectStatusRead:
     await _authorize(session, actor, "archive", entity_code, object_id)
     service = RuntimeObjectService(session)
-    before = await _execute(service.get(entity_code, object_id))
+    before = await _execute(
+        service.get(entity_code, object_id, actor_roles=actor.roles)
+    )
     await session.rollback()
     response = await _execute(service.restore(entity_code, object_id, actor.id))
     await AuditService(session).record(
@@ -417,7 +546,9 @@ async def delete_entity_object(
 ) -> EntityObjectDeleteRead:
     await _authorize(session, actor, "delete", entity_code, object_id)
     service = RuntimeObjectService(session)
-    before = await _execute(service.get(entity_code, object_id))
+    before = await _execute(
+        service.get(entity_code, object_id, actor_roles=actor.roles)
+    )
     await session.rollback()
     await delete_object_storage_files(session, get_minio_client(), object_id)
     await session.rollback()
@@ -476,6 +607,33 @@ async def _authorize(
         raise HTTPException(status_code=403, detail="Недостаточно прав для операции") from error
     except AccessResourceNotFound as error:
         raise HTTPException(status_code=404, detail="Сущность или объект не найден") from error
+    finally:
+        await session.rollback()
+
+
+async def _authorize_filter_dependencies(
+    session: AsyncSession,
+    actor,
+    entity_code: str,
+    filters: list[ObjectFilter],
+) -> None:
+    """Не позволять составному фильтру обходить права связанной сущности."""
+
+    try:
+        related_codes = await RuntimeObjectService(session).filter_dependency_entity_codes(
+            entity_code,
+            filters,
+        )
+        authorization = AuthorizationService(session)
+        for related_code in related_codes:
+            await authorization.require_entity_code(actor, "read", related_code)
+    except AccessDenied as error:
+        raise HTTPException(
+            status_code=403,
+            detail="Недостаточно прав для фильтрации по связанной сущности",
+        ) from error
+    except (AccessResourceNotFound, RuntimeEntityNotFound) as error:
+        raise HTTPException(status_code=404, detail="Связанная сущность не найдена") from error
     finally:
         await session.rollback()
 

@@ -24,7 +24,12 @@ from app.modules.excel.api.schemas import ExcelMapping
 from app.modules.excel.application.service import ExcelService
 from app.modules.change_sets.api.schemas import ChangeSetCreate
 from app.modules.change_sets.application.service import ChangeSetService
-from app.shared.db.models import EntityObjectModel, ImportJobModel, ImportRowModel
+from app.shared.db.models import (
+    EntityObjectModel,
+    ImportJobModel,
+    ImportRowModel,
+    NotificationModel,
+)
 
 log = logging.getLogger(__name__)
 
@@ -119,7 +124,7 @@ async def _run_import(
             if not should_continue:
                 return
             batch = payloads[start : start + settings.import_batch_size]
-            await _import_batch(job_id, entity_code, actor.id, start + 1, batch)
+            await _import_batch(job_id, entity_code, actor, start + 1, batch)
             start += len(batch)
         await _finish_job(job_id, "completed")
     except Exception:
@@ -216,7 +221,7 @@ async def _run_excel_change_set(
 async def _import_batch(
     job_id: UUID,
     entity_code: str,
-    actor_id: UUID,
+    actor: ActorContext,
     first_row_number: int,
     batch: Sequence[Any],
 ) -> None:
@@ -259,14 +264,15 @@ async def _import_batch(
             response = await service.create_many(
                 entity_code,
                 [item[1] for item in to_create],
-                actor_id,
+                actor.id,
                 object_ids=[item[2] for item in to_create],
+                actor_roles=actor.roles,
             ) if to_create else None
         except RuntimeValidationError:
             await _import_batch_one_by_one(
                 job_id,
                 entity_code,
-                actor_id,
+                actor,
                 first_row_number,
                 batch,
             )
@@ -310,7 +316,7 @@ async def _import_batch(
 async def _import_batch_one_by_one(
     job_id: UUID,
     entity_code: str,
-    actor_id: UUID,
+    actor: ActorContext,
     first_row_number: int,
     batch: Sequence[Any],
 ) -> None:
@@ -343,8 +349,9 @@ async def _import_batch_one_by_one(
                     await service.create_many(
                         entity_code,
                         [payload],
-                        actor_id,
+                        actor.id,
                         object_ids=[object_id],
+                        actor_roles=actor.roles,
                     )
                     if existing is None
                     else None
@@ -449,6 +456,32 @@ async def _finish_job(job_id: UUID, status: str) -> None:
             job = await session.get(ImportJobModel, job_id, with_for_update=True)
             if job is not None and job.status != "cancelled":
                 job.status = status
+                if job.created_by is not None:
+                    notification_exists = await session.scalar(
+                        select(NotificationModel.id).where(
+                            NotificationModel.user_id == job.created_by,
+                            NotificationModel.type == f"import.{status}",
+                            NotificationModel.resource_type == "import_job",
+                            NotificationModel.resource_id == job.id,
+                        )
+                    )
+                    if notification_exists is None:
+                        session.add(NotificationModel(
+                            user_id=job.created_by,
+                            type=f"import.{status}",
+                            title="Импорт завершён" if status == "completed" else "Ошибка импорта",
+                            message=(
+                                f"Файл «{job.source_name}» успешно обработан"
+                                if status == "completed"
+                                else f"Не удалось обработать файл «{job.source_name}»"
+                            ),
+                            resource_type="import_job",
+                            resource_id=job.id,
+                            metadata_json={
+                                "processedRows": job.processed_rows,
+                                "errorRows": job.error_rows,
+                            },
+                        ))
 
 
 async def _read_temp_file(storage: Minio, storage_key: str) -> bytes:

@@ -15,6 +15,7 @@ from app.core.config import settings
 from app.core.database import dispose_database
 from app.core.redis import create_redis_client
 from app.modules.imports.api.router import websocket_router as import_websocket_router
+from app.modules.objects.api.generated import read_router as generated_read_router
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -219,4 +220,5 @@ def _error_code(status_code: int) -> str:
 
 app.include_router(health_router)
 app.include_router(api_router, prefix=settings.api_v1_prefix)
+app.include_router(generated_read_router, prefix=settings.api_v1_prefix)
 app.include_router(import_websocket_router, prefix=settings.api_v1_prefix)

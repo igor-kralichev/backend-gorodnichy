@@ -23,7 +23,7 @@ router = APIRouter(prefix="/search", tags=["Поиск и подсказки"])
     ),
 )
 async def suggest_objects(
-    _actor: CurrentActor,
+    actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
     query: Annotated[
         str,
@@ -49,4 +49,5 @@ async def suggest_objects(
         entity_code=entity_code,
         field_code=field_code,
         limit=limit,
+        actor=actor,
     )

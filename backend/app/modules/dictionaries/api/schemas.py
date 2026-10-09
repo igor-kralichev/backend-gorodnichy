@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -36,7 +37,18 @@ class DictionaryItemCreate(ApiModel):
 class DictionaryCreate(ApiModel):
     """Команда создания справочника сущности."""
 
-    entity_id: UUID = Field(description="UUID сущности, которой принадлежит справочник")
+    scope: Literal["global", "organization", "entity"] = Field(
+        default="entity",
+        description="Область доступности справочника",
+    )
+    entity_id: UUID | None = Field(
+        default=None,
+        description="UUID сущности для scope=entity",
+    )
+    owner_organization_id: UUID | None = Field(
+        default=None,
+        description="UUID организации для scope=organization",
+    )
     code: str | None = Field(
         default=None,
         min_length=1,
@@ -61,6 +73,14 @@ class DictionaryCreate(ApiModel):
 
     @model_validator(mode="after")
     def validate_items(self) -> "DictionaryCreate":
+        if self.scope == "entity" and self.entity_id is None:
+            raise ValueError("Для scope=entity необходимо передать entityId")
+        if self.scope != "entity" and self.entity_id is not None:
+            raise ValueError("entityId разрешён только для scope=entity")
+        if self.scope == "organization" and self.owner_organization_id is None:
+            raise ValueError("Для scope=organization необходимо передать ownerOrganizationId")
+        if self.scope != "organization" and self.owner_organization_id is not None:
+            raise ValueError("ownerOrganizationId разрешён только для scope=organization")
         explicit_codes = [item.code for item in self.items if item.code]
         if len(set(explicit_codes)) != len(explicit_codes):
             raise ValueError("Коды элементов справочника должны быть уникальными")
@@ -70,6 +90,7 @@ class DictionaryCreate(ApiModel):
 class DictionaryUpdate(ApiModel):
     """Команда изменения справочника сущности."""
 
+    revision: int = Field(ge=1, description="Ожидаемая ревизия справочника")
     code: str | None = Field(
         default=None,
         min_length=1,
@@ -101,13 +122,46 @@ class DictionaryUpdate(ApiModel):
 
     @model_validator(mode="after")
     def validate_update(self) -> "DictionaryUpdate":
-        if not self.model_fields_set:
+        if not (self.model_fields_set - {"revision"}):
             raise ValueError("Необходимо передать хотя бы одно изменение")
         if self.items is not None:
             explicit_codes = [item.code for item in self.items if item.code]
             if len(set(explicit_codes)) != len(explicit_codes):
                 raise ValueError("Коды элементов справочника должны быть уникальными")
         return self
+
+
+class DictionaryItemUpdate(ApiModel):
+    """Атомарное изменение одного элемента справочника."""
+
+    revision: int = Field(ge=1, description="Ожидаемая ревизия справочника")
+    code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=120,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+    name: str | None = Field(default=None, min_length=1, max_length=500)
+    active: bool | None = None
+    sort_order: int | None = Field(default=None, ge=1)
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @model_validator(mode="after")
+    def require_change(self) -> "DictionaryItemUpdate":
+        if not (self.model_fields_set - {"revision"}):
+            raise ValueError("Необходимо передать хотя бы одно изменение элемента")
+        return self
+
+
+class DictionaryItemMutation(ApiModel):
+    """Добавление элемента с optimistic revision справочника."""
+
+    revision: int = Field(ge=1, description="Ожидаемая ревизия справочника")
+    item: DictionaryItemCreate
 
 
 class DictionaryItemRead(ApiModel):
@@ -126,10 +180,17 @@ class DictionaryRead(ApiModel):
     """Справочник сущности."""
 
     id: UUID = Field(description="UUID справочника")
-    entity_id: UUID = Field(description="UUID сущности")
+    scope: Literal["global", "organization", "entity"]
+    entity_id: UUID | None = Field(description="UUID сущности")
+    owner_organization_id: UUID | None = Field(description="UUID организации-владельца")
+    revision: int = Field(ge=1, description="Ревизия для защиты параллельных изменений")
     code: str = Field(description="Машинный код справочника")
     name: str = Field(description="Название справочника")
     active: bool = Field(description="Доступен ли справочник")
+    capabilities: list[Literal["read", "manage"]] = Field(
+        default_factory=lambda: ["read"],
+        description="Эффективные действия текущего пользователя",
+    )
     items: list[DictionaryItemRead] = Field(description="Элементы справочника")
     created_at: datetime = Field(description="Дата создания")
     updated_at: datetime = Field(description="Дата изменения")
@@ -149,6 +210,7 @@ class DictionaryStatusRead(ApiModel):
 
     id: UUID = Field(description="UUID справочника")
     active: bool = Field(description="Доступен ли справочник")
+    revision: int = Field(ge=1, description="Новая ревизия справочника")
 
 
 class DictionaryDeleteRead(ApiModel):
@@ -156,3 +218,33 @@ class DictionaryDeleteRead(ApiModel):
 
     id: UUID = Field(description="UUID справочника")
     deleted: bool = Field(description="Справочник удалён")
+
+
+class DictionaryExcelPreviewRow(ApiModel):
+    row: int
+    value: str | None
+    state: Literal["new", "existing", "duplicate", "empty", "error"]
+    message: str | None = None
+
+
+class DictionaryExcelPreviewRead(ApiModel):
+    sheets: list[str]
+    selected_sheet: str
+    header_row: int
+    headers: list[str]
+    value_column: str
+    total_rows: int
+    new_count: int
+    existing_count: int
+    duplicate_count: int
+    empty_count: int
+    rows: list[DictionaryExcelPreviewRow]
+
+
+class DictionaryExcelImportRead(ApiModel):
+    dictionary: DictionaryRead
+    created_count: int
+    existing_count: int
+    duplicate_count: int
+    empty_count: int
+    metadata: dict[str, Any] = Field(default_factory=dict)

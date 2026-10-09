@@ -1,4 +1,4 @@
-from typing import Annotated, cast
+from typing import Annotated, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from redis.asyncio import Redis
@@ -11,6 +11,10 @@ from app.modules.audit.application.service import AuditService
 from app.modules.entities.api.schemas import (
     EntityCreate,
     EntityDeleteRead,
+    EntityDraftPatch,
+    EntityDraftPublish,
+    EntityDraftRead,
+    EntityDraftValidationRead,
     EntityDuplicateCreate,
     EntityListRead,
     EntityRead,
@@ -64,6 +68,116 @@ def raise_entity_http_error(error: Exception) -> None:
             },
         ) from error
     raise error
+
+
+@router.get(
+    "/{identifier}/draft",
+    response_model=EntityDraftRead,
+    response_model_by_alias=True,
+    summary="Получить или создать черновик схемы",
+)
+async def get_entity_draft(
+    identifier: str,
+    actor: AdminActor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> EntityDraftRead:
+    try:
+        return await EntitySchemaManagementService(session, redis).get_or_create_draft(
+            identifier, actor.id
+        )
+    except Exception as error:
+        raise_entity_http_error(error)
+        raise
+
+
+@router.patch(
+    "/{identifier}/draft",
+    response_model=EntityDraftRead,
+    response_model_by_alias=True,
+    summary="Автосохранить изменения черновика схемы",
+)
+async def update_entity_draft(
+    identifier: str,
+    payload: EntityDraftPatch,
+    actor: AdminActor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> EntityDraftRead:
+    try:
+        service = EntitySchemaManagementService(session, redis)
+        entity = await service.get(identifier)
+        await session.rollback()
+        response = await service.update_draft(identifier, payload, actor.id)
+        await AuditService(session).record(
+            actor=actor,
+            resource_type="entity_schema",
+            resource_id=entity.id,
+            resource_code=entity.code,
+            resource_name=entity.name,
+            action="entity_schema.draft_updated",
+            old_value={"baseVersion": payload.expected_version},
+            new_value=response,
+        )
+        return response
+    except Exception as error:
+        raise_entity_http_error(error)
+        raise
+
+
+@router.post(
+    "/{identifier}/draft/validation",
+    response_model=EntityDraftValidationRead,
+    response_model_by_alias=True,
+    summary="Проверить влияние черновика схемы",
+)
+async def validate_entity_draft(
+    identifier: str,
+    _actor: AdminActor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> EntityDraftValidationRead:
+    try:
+        return await EntitySchemaManagementService(session, redis).validate_draft(identifier)
+    except Exception as error:
+        raise_entity_http_error(error)
+        raise
+
+
+@router.post(
+    "/{identifier}/draft/publish",
+    response_model=EntityRead,
+    response_model_by_alias=True,
+    summary="Опубликовать черновик схемы",
+)
+async def publish_entity_draft(
+    identifier: str,
+    payload: EntityDraftPublish,
+    actor: AdminActor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> EntityRead:
+    try:
+        service = EntitySchemaManagementService(session, redis)
+        before = await service.get(identifier)
+        await session.rollback()
+        response = await service.publish_draft(
+            identifier, payload.expected_version, actor.id
+        )
+        await AuditService(session).record(
+            actor=actor,
+            resource_type="entity_schema",
+            resource_id=response.id,
+            resource_code=response.code,
+            resource_name=response.name,
+            action="entity_schema.draft_published",
+            old_value=before,
+            new_value=response,
+        )
+        return response
+    except Exception as error:
+        raise_entity_http_error(error)
+        raise
 
 
 @router.post(
@@ -120,12 +234,22 @@ async def list_entity_schemas(
         bool,
         Query(alias="includeArchived", description="Включить архивные сущности"),
     ] = False,
+    query: Annotated[
+        str | None,
+        Query(alias="q", min_length=1, max_length=300, description="Поиск по коду, названию и описанию"),
+    ] = None,
+    sort: Annotated[
+        Literal["name", "-name", "updatedAt", "-updatedAt", "createdAt", "-createdAt"],
+        Query(description="Сортировка каталога"),
+    ] = "-updatedAt",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> EntityListRead:
     return await EntitySchemaManagementService(session, redis).list(
         status_filter=status_filter,
         include_archived=include_archived,
+        query=query,
+        sort=sort,
         limit=limit,
         offset=offset,
     )

@@ -1,22 +1,50 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Path, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session, session_factory
 from app.core.security import CurrentActor, actor_from_token
 from app.core.storage import get_minio_client
-from app.modules.objects.api.schemas import ObjectImportJobCommand, ObjectImportJobRead
+from app.modules.objects.api.schemas import (
+    ObjectImportJobCommand,
+    ObjectImportJobPage,
+    ObjectImportJobRead,
+)
 from app.modules.objects.application.imports import ObjectImportService
 from app.modules.objects.application.service import RuntimeEntityNotFound
 
 router = APIRouter(prefix="/importJobs", tags=["Фоновые импорты"])
 websocket_router = APIRouter(prefix="/importJobs", tags=["Фоновые импорты"])
 JobId = Annotated[UUID, Path(alias="jobId", description="UUID фоновой задачи импорта")]
+
+
+@router.get(
+    "",
+    response_model=ObjectImportJobPage,
+    response_model_by_alias=True,
+    summary="Получить свои фоновые импорты",
+)
+async def list_import_jobs(
+    actor: CurrentActor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    job_status: Annotated[
+        Literal["queued", "running", "paused", "completed", "failed", "cancelled"] | None,
+        Query(alias="status"),
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> ObjectImportJobPage:
+    return await ObjectImportService(session, get_minio_client()).list_page(
+        actor_id=actor.id,
+        status=job_status,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get(

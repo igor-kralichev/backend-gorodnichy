@@ -18,7 +18,11 @@ from app.modules.change_sets.api.schemas import (
 )
 from app.modules.entities.infrastructure.models import EntitySchemaModel, EntitySchemaVersionModel
 from app.modules.objects.api.schemas import EntityObjectCreate, ValidationIssue
-from app.modules.objects.application.service import RuntimeObjectService
+from app.modules.objects.application.service import (
+    RuntimeObjectNotFound,
+    RuntimeObjectService,
+    RuntimeValidationError,
+)
 from app.shared.db.models import (
     AuditEventModel,
     ChangeSetItemModel,
@@ -83,7 +87,13 @@ class ChangeSetService:
             runtime = RuntimeObjectService(self._session)
             all_valid = True
             for proposed in payload.items:
-                item = await self._build_item(runtime, schema, change_set.id, proposed)
+                item = await self._build_item(
+                    runtime,
+                    schema,
+                    change_set.id,
+                    proposed,
+                    actor,
+                )
                 all_valid = all_valid and item.status == "valid"
                 self._session.add(item)
             change_set.status = "validated" if all_valid else "draft"
@@ -120,6 +130,12 @@ class ChangeSetService:
             schema = await self._session.get(EntitySchemaModel, change_set.entity_schema_id)
             if schema is None or schema.status != "active":
                 raise ChangeSetValidationError("Опубликованная сущность недоступна")
+            current_schema_version_id = await self._version_id(schema.id)
+            if current_schema_version_id != change_set.schema_version_id:
+                raise ChangeSetConflict(
+                    "Схема сущности изменилась после подготовки набора; "
+                    "подготовьте набор повторно по текущей версии"
+                )
             items = list(
                 await self._session.scalars(
                     select(ChangeSetItemModel)
@@ -161,7 +177,7 @@ class ChangeSetService:
                 for item in items:
                     if item.status != "valid":
                         continue
-                    await self._apply_item(runtime, schema, item, actor.id)
+                    await self._apply_item(runtime, schema, item, actor)
                 change_set.status = "applied"
                 change_set.decided_by = actor.id
                 change_set.decided_at = datetime.now(UTC)
@@ -212,13 +228,23 @@ class ChangeSetService:
         schema: EntitySchemaModel,
         change_set_id: UUID,
         proposed: ChangeSetItemCreate,
+        actor: ActorContext,
     ) -> ChangeSetItemModel:
         values = proposed.values
         geometry = proposed.geometry
+        parent_object_id = proposed.parent_object_id
+        parent_errors: list[dict[str, str | None]] = []
+        if proposed.operation in {"create", "update"}:
+            runtime._ensure_writable_fields(  # noqa: SLF001
+                schema,
+                proposed.values,
+                action=proposed.operation,
+                actor_roles=actor.roles,
+            )
         if proposed.operation != "create":
             try:
                 current, current_geometry = await runtime._get_object(schema.id, proposed.object_id)  # noqa: SLF001
-            except Exception:
+            except RuntimeObjectNotFound:
                 return ChangeSetItemModel(
                     change_set_id=change_set_id,
                     object_id=proposed.object_id,
@@ -231,11 +257,31 @@ class ChangeSetService:
             if proposed.operation in {"update", "confirm"}:
                 values = {**current.values, **values}
                 geometry = geometry or current_geometry
+                if parent_object_id is None:
+                    parent_object_id = current.parent_object_id
+        if proposed.operation in {"create", "update"}:
+            try:
+                parent_object_id = await runtime._resolve_parent_object_id(  # noqa: SLF001
+                    schema,
+                    parent_object_id,
+                )
+            except RuntimeValidationError as error:
+                parent_errors.extend(error.issues)
         normalized = await runtime._normalize_values(schema, dict(values))  # noqa: SLF001
         errors = [] if proposed.operation == "archive" else await runtime._validate(schema, normalized, geometry)  # noqa: SLF001
+        errors.extend(parent_errors)
+        if proposed.operation in {"create", "update"}:
+            errors.extend(
+                await runtime._unique_issues(  # noqa: SLF001
+                    schema,
+                    normalized,
+                    exclude_object_id=proposed.object_id,
+                )
+            )
         return ChangeSetItemModel(
             change_set_id=change_set_id,
             object_id=proposed.object_id,
+            parent_object_id=parent_object_id,
             operation=proposed.operation,
             base_revision=proposed.base_revision,
             proposed_values=normalized,
@@ -249,7 +295,7 @@ class ChangeSetService:
         runtime: RuntimeObjectService,
         schema: EntitySchemaModel,
         item: ChangeSetItemModel,
-        actor_id: UUID,
+        actor: ActorContext,
     ) -> None:
         geometry_json = None
         if item.proposed_geometry is not None:
@@ -257,22 +303,48 @@ class ChangeSetService:
         geometry = runtime._parse_geometry(geometry_json)  # noqa: SLF001
         if item.operation == "create":
             object_id = uuid4()
-            errors = await runtime._validate(schema, item.proposed_values, geometry)  # noqa: SLF001
+            writable_values = {
+                field.code: item.proposed_values[field.code]
+                for field in schema.fields
+                if field.field_type != "calculated"
+                and field.code in item.proposed_values
+            }
+            runtime._ensure_writable_fields(  # noqa: SLF001
+                schema,
+                writable_values,
+                action="create",
+                actor_roles=actor.roles,
+            )
+            normalized = await runtime._normalize_values(  # noqa: SLF001
+                schema,
+                dict(item.proposed_values),
+            )
+            errors = await runtime._validate(schema, normalized, geometry)  # noqa: SLF001
+            errors.extend(await runtime._unique_issues(schema, normalized))  # noqa: SLF001
+            if errors:
+                raise ChangeSetValidationError(
+                    "Набор больше не проходит проверку: "
+                    + "; ".join(error["message"] or error["code"] for error in errors[:3])
+                )
             model = EntityObjectModel(
                 id=object_id,
                 entity_schema_id=schema.id,
                 schema_version_id=await runtime._schema_version_id(schema.id),  # noqa: SLF001
+                parent_object_id=await runtime._resolve_parent_object_id(  # noqa: SLF001
+                    schema,
+                    item.parent_object_id,
+                ),
                 municipality_id=schema.scope_municipality_id,
                 owner_organization_id=schema.owner_organization_id,
-                values=item.proposed_values,
+                values=normalized,
                 geometry=runtime._geometry_expression(geometry),  # noqa: SLF001
                 attachment_paths=[],
                 status="published" if not errors else "draft",
                 data_quality="complete" if not errors else "incomplete",
                 validation_errors=errors,
                 revision=1,
-                created_by=actor_id,
-                updated_by=actor_id,
+                created_by=actor.id,
+                updated_by=actor.id,
             )
             self._session.add(model)
             await self._session.flush()
@@ -286,26 +358,69 @@ class ChangeSetService:
                     object_id=model.id,
                     revision=1,
                     event_type="object.created",
-                    actor_id=actor_id,
+                    actor_id=actor.id,
                     before_values=None,
                     after_values=dict(model.values),
                     changes=runtime._changes({}, model.values, schema.fields),  # noqa: SLF001
                     metadata_json={"changeSetId": str(item.change_set_id)},
                 )
             )
-            runtime._add_outbox("entity_object.created.v1", model, schema.code, actor_id)  # noqa: SLF001
+            runtime._add_outbox("entity_object.created.v1", model, schema.code, actor.id)  # noqa: SLF001
             return
-        model = await self._session.scalar(
-            select(EntityObjectModel).where(EntityObjectModel.id == item.object_id).with_for_update()
-        )
-        if model is None:
+        try:
+            model, current_geometry = await runtime._get_object(  # noqa: SLF001
+                schema.id,
+                item.object_id,
+                for_update=True,
+            )
+        except RuntimeObjectNotFound:
             raise ChangeSetConflict
         before = dict(model.values)
         if item.operation == "archive":
             model.status = "archived"
             model.archived_at = datetime.now(UTC)
         elif item.operation == "update":
-            model.values = item.proposed_values
+            if item.parent_object_id != model.parent_object_id:
+                model.parent_object_id = await runtime._resolve_parent_object_id(  # noqa: SLF001
+                    schema,
+                    item.parent_object_id,
+                )
+            normalized = await runtime._normalize_values(  # noqa: SLF001
+                schema,
+                dict(item.proposed_values),
+            )
+            calculated_codes = {
+                field.code for field in schema.fields if field.field_type == "calculated"
+            }
+            changed_values = {
+                code: value
+                for code, value in normalized.items()
+                if before.get(code) != value and code not in calculated_codes
+            }
+            runtime._ensure_writable_fields(  # noqa: SLF001
+                schema,
+                changed_values,
+                action="update",
+                actor_roles=actor.roles,
+            )
+            errors = await runtime._validate(schema, normalized, geometry)  # noqa: SLF001
+            errors.extend(
+                await runtime._unique_issues(  # noqa: SLF001
+                    schema,
+                    normalized,
+                    exclude_object_id=model.id,
+                )
+            )
+            if errors:
+                raise ChangeSetValidationError(
+                    "Набор больше не проходит проверку: "
+                    + "; ".join(error["message"] or error["code"] for error in errors[:3])
+                )
+            if normalized == before and geometry == current_geometry:
+                item.result_object_id = model.id
+                item.status = "applied"
+                return
+            model.values = normalized
             model.geometry = runtime._geometry_expression(geometry)  # noqa: SLF001
             model.status = "published"
             model.data_quality = "complete"
@@ -336,12 +451,12 @@ class ChangeSetService:
                             object_id=model.id,
                             entity_field_id=field.id,
                             value_hash=value_hash,
-                            confirmed_by=actor_id,
+                            confirmed_by=actor.id,
                             method="change_set",
                         )
                     )
         model.revision += 1
-        model.updated_by = actor_id
+        model.updated_by = actor.id
         item.result_object_id = model.id
         item.status = "applied"
         self._session.add(
@@ -350,7 +465,7 @@ class ChangeSetService:
                 object_id=model.id,
                 revision=model.revision,
                 event_type=f"object.{item.operation}",
-                actor_id=actor_id,
+                actor_id=actor.id,
                 before_values=before,
                 after_values=dict(model.values),
                 changes=runtime._changes(before, model.values, schema.fields),  # noqa: SLF001
@@ -358,7 +473,7 @@ class ChangeSetService:
             )
         )
         runtime._add_outbox(  # noqa: SLF001
-            f"entity_object.{item.operation}.v1", model, schema.code, actor_id
+            f"entity_object.{item.operation}.v1", model, schema.code, actor.id
         )
 
     async def _schema(self, code: str) -> EntitySchemaModel:
@@ -401,6 +516,7 @@ class ChangeSetService:
                 ChangeSetItemRead(
                     id=item.id,
                     object_id=item.object_id,
+                    parent_object_id=item.parent_object_id,
                     operation=item.operation,
                     base_revision=item.base_revision,
                     proposed_values=item.proposed_values,

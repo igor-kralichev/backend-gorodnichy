@@ -20,6 +20,7 @@ services:
     volumes:
       - nominatim_data:/var/lib/postgresql/16/main
       - nominatim_flatnode:/nominatim/flatnode
+      - nominatim_pbf:/var/cache/nominatim
     restart: unless-stopped
     networks:
       platform:
@@ -31,6 +32,8 @@ volumes:
     name: municipal_low_code_nominatim_data
   nominatim_flatnode:
     name: municipal_low_code_nominatim_flatnode
+  nominatim_pbf:
+    name: municipal_low_code_nominatim_pbf
 
 networks:
   platform:

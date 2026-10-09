@@ -93,6 +93,30 @@ class AuditService:
             offset=offset,
         )
 
+    @staticmethod
+    def redact_object_fields(
+        page: AuditEventPage,
+        allowed_codes: set[str],
+    ) -> AuditEventPage:
+        """Скрыть динамические значения, недоступные сотруднику."""
+
+        for event in page.items:
+            for payload in (event.old_value, event.new_value):
+                if not payload:
+                    continue
+                values = payload.get("values")
+                if isinstance(values, dict):
+                    payload["values"] = {
+                        code: value for code, value in values.items() if code in allowed_codes
+                    }
+            event.changes = [
+                change
+                for change in event.changes
+                if not change.path.startswith("values.")
+                or change.path.split(".", 1)[1] in allowed_codes
+            ]
+        return page
+
 
 def _json_payload(value: object | None) -> dict[str, Any] | None:
     if value is None:

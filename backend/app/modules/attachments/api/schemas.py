@@ -21,6 +21,7 @@ class AttachmentRead(ApiModel):
     entity_id: UUID = Field(description="UUID сущности")
     entity_code: str = Field(description="Код сущности")
     object_id: UUID = Field(description="UUID объекта")
+    field_id: UUID | None = Field(default=None, description="UUID динамического file-поля")
     kind: AttachmentKind = Field(description="Тип файла: фото или документ")
     original_name: str = Field(description="Имя файла, которое загрузил пользователь")
     storage_key: str = Field(description="Технический ключ файла в MinIO")
@@ -62,6 +63,7 @@ class AttachmentUpdate(ApiModel):
 
     original_name: str | None = Field(default=None, min_length=1, max_length=1024, description="Новое имя файла для UI")
     kind: AttachmentKind | None = Field(default=None, description="Новый тип файла")
+    field_id: UUID | None = Field(default=None, description="Новое file-поле или null")
 
     @field_validator("original_name")
     @classmethod

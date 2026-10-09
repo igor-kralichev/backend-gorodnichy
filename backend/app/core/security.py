@@ -76,7 +76,11 @@ def _keycloak_actor(token: str) -> ActorContext:
             signing_key.key,
             algorithms=["RS256"],
             issuer=settings.keycloak_issuer,
-            options={"verify_aud": False},
+            audience=settings.keycloak_api_audience,
+            options={
+                "verify_aud": True,
+                "require": ["exp", "iat", "sub"],
+            },
         )
     except (InvalidTokenError, PyJWKClientError) as error:
         raise HTTPException(
@@ -85,6 +89,12 @@ def _keycloak_actor(token: str) -> ActorContext:
             headers={"WWW-Authenticate": "Bearer"},
         ) from error
 
+    if payload.get("typ") != "Bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Ожидался access token типа Bearer",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     subject = _required_uuid_claim(payload, "sub")
     roles = _realm_roles(payload)
     return ActorContext(

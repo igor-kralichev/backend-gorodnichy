@@ -24,6 +24,12 @@ class ApiModel(BaseModel):
 
 
 HexColor = Annotated[str, Field(pattern=r"^#[0-9a-fA-F]{6}$")]
+ALLOWED_MARKER_ICONS = frozenset(
+    {"map-pin", "circle", "square", "triangle", "building", "school", "flag", "star"}
+)
+ALLOWED_UNIT_CODES = frozenset(
+    {"count", "person", "meter", "kilometer", "square_meter", "hectare", "percent", "ruble"}
+)
 
 
 class MapStyle(ApiModel):
@@ -34,6 +40,20 @@ class MapStyle(ApiModel):
     stroke_width: float = Field(gt=0, le=20, description="Толщина контура")
     point_size: float = Field(gt=0, le=100, description="Размер точечного маркера")
     opacity: float = Field(ge=0, le=1, description="Прозрачность от 0 до 1")
+    marker_icon: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=120,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+        description="Имя маркера из разрешённого каталога иконок",
+    )
+
+    @field_validator("marker_icon")
+    @classmethod
+    def validate_marker_icon(cls, value: str | None) -> str | None:
+        if value is not None and value not in ALLOWED_MARKER_ICONS:
+            raise ValueError("Неизвестная иконка маркера")
+        return value
 
 
 class MapStylesCreate(ApiModel):
@@ -155,6 +175,19 @@ class EntityFieldCreate(ApiModel):
         default=None,
         description="Проверяемое дерево выражения вычисляемого поля",
     )
+    unit_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_./%-]*$",
+        description="Код единицы измерения числового поля",
+    )
+    decimal_scale: int | None = Field(
+        default=None,
+        ge=0,
+        le=12,
+        description="Количество знаков после запятой",
+    )
     enum_id: UUID | None = Field(
         default=None,
         description="UUID справочника; только для типа enum",
@@ -196,6 +229,13 @@ class EntityFieldCreate(ApiModel):
             self.read_only = True
         elif self.formula is not None:
             raise ValueError("formula разрешена только для поля calculated")
+        numeric_types = {FieldType.INTEGER, FieldType.DECIMAL, FieldType.CALCULATED}
+        if self.unit_code is not None and self.type not in numeric_types:
+            raise ValueError("unitCode разрешён только для числового поля")
+        if self.unit_code is not None and self.unit_code not in ALLOWED_UNIT_CODES:
+            raise ValueError("Неизвестная единица измерения")
+        if self.decimal_scale is not None and self.type not in {FieldType.DECIMAL, FieldType.CALCULATED}:
+            raise ValueError("decimalScale разрешён только для decimal или calculated")
         return self
 
 
@@ -400,6 +440,31 @@ class EntityUpdate(ApiModel):
                 raise ValueError("Разрешено только одно поле адреса")
             _validate_formula_graph(self.fields)
         return self
+
+
+class EntityDraftPatch(ApiModel):
+    """Автосохранение изменений в отдельный черновик схемы."""
+
+    expected_version: int = Field(ge=1, description="Версия active-схемы, от которой создан черновик")
+    changes: EntityUpdate
+
+
+class EntityDraftPublish(ApiModel):
+    expected_version: int = Field(ge=1)
+
+
+class EntityDraftRead(ApiModel):
+    id: UUID
+    entity_id: UUID
+    base_version: int
+    draft_schema: EntityCreate = Field(alias="schema")
+    updated_at: datetime
+
+
+class EntityDraftValidationRead(ApiModel):
+    valid: bool
+    issues: list[str]
+    impact: dict[str, int]
 
 
 def _validate_formula_graph(fields: list[EntityFieldCreate]) -> None:

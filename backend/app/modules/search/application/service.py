@@ -1,6 +1,8 @@
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import ActorContext
+from app.modules.access.application.service import AuthorizationService
 from app.modules.entities.infrastructure.models import EntitySchemaModel
 from app.modules.search.api.schemas import ObjectSuggestionPage, ObjectSuggestionRead
 from app.shared.db.models import EntityObjectModel, ObjectSearchIndexModel
@@ -19,6 +21,7 @@ class ObjectSuggestionService:
         entity_code: str | None,
         field_code: str | None,
         limit: int,
+        actor: ActorContext,
     ) -> ObjectSuggestionPage:
         normalized_query = self._normalize(query)
         if not normalized_query:
@@ -33,6 +36,9 @@ class ObjectSuggestionService:
             conditions.append(EntitySchemaModel.code == entity_code)
         if field_code is not None:
             conditions.append(ObjectSearchIndexModel.field_code == field_code)
+        conditions.append(
+            await AuthorizationService(self._session).readable_object_condition(actor)
+        )
 
         statement = (
             select(

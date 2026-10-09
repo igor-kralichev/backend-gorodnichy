@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     redis_schema_ttl_seconds: int = 3600
     rabbitmq_url: str = "amqp://lowcode:lowcode@rabbitmq:5672/"
     import_queue_name: str = "object-imports"
+    excel_export_queue_name: str = "excel-exports"
     outbox_queue_name: str = "platform-events"
     outbox_batch_size: int = 100
     outbox_poll_interval_seconds: float = 1.0
@@ -25,6 +26,8 @@ class Settings(BaseSettings):
     excel_max_file_size_bytes: int = 30 * 1024 * 1024
     excel_max_sheets: int = 20
     excel_max_rows: int = 50_000
+    excel_export_max_rows: int = 500_000
+    excel_export_ttl_hours: int = 24
     excel_max_columns: int = 200
     excel_max_uncompressed_bytes: int = 200 * 1024 * 1024
     cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["http://localhost:5173"])
@@ -35,6 +38,7 @@ class Settings(BaseSettings):
     keycloak_internal_url: str = "http://keycloak:8080"
     keycloak_realm: str = "municipal-low-code"
     keycloak_api_client_id: str = "municipal-api"
+    keycloak_api_audience: str = "municipal-api"
     keycloak_api_client_secret: str = "municipal-api-secret"
     keycloak_swagger_client_id: str = "municipal-spa"
     minio_endpoint: str = "minio:9000"

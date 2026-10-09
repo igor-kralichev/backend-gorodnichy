@@ -17,11 +17,76 @@
     "realm": [
       {
         "name": "Admin",
-        "description": "Администратор платформы"
+        "description": "Администратор платформы",
+        "composite": true,
+        "composites": {
+          "realm": [
+            "permission_read",
+            "permission_create",
+            "permission_update",
+            "permission_archive",
+            "permission_delete",
+            "permission_manage_schema",
+            "permission_manage_access",
+            "permission_export",
+            "permission_import",
+            "permission_request",
+            "permission_review",
+            "permission_confirm"
+          ]
+        }
       },
       {
         "name": "User",
         "description": "Пользователь платформы"
+      },
+      {
+        "name": "permission_read",
+        "description": "Глобальное чтение данных"
+      },
+      {
+        "name": "permission_create",
+        "description": "Глобальное создание данных"
+      },
+      {
+        "name": "permission_update",
+        "description": "Глобальное изменение данных"
+      },
+      {
+        "name": "permission_archive",
+        "description": "Глобальное архивирование данных"
+      },
+      {
+        "name": "permission_delete",
+        "description": "Глобальное удаление данных"
+      },
+      {
+        "name": "permission_manage_schema",
+        "description": "Глобальное управление схемами"
+      },
+      {
+        "name": "permission_manage_access",
+        "description": "Глобальное управление доступом"
+      },
+      {
+        "name": "permission_export",
+        "description": "Глобальный экспорт данных"
+      },
+      {
+        "name": "permission_import",
+        "description": "Глобальный импорт данных"
+      },
+      {
+        "name": "permission_request",
+        "description": "Глобальное создание запросов"
+      },
+      {
+        "name": "permission_review",
+        "description": "Глобальная проверка данных"
+      },
+      {
+        "name": "permission_confirm",
+        "description": "Глобальное подтверждение данных"
       }
     ]
   },
@@ -36,7 +101,21 @@
       "serviceAccountsEnabled": true,
       "standardFlowEnabled": false,
       "directAccessGrantsEnabled": false,
-      "bearerOnly": false
+      "bearerOnly": false,
+      "protocolMappers": [
+        {
+          "name": "municipal-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "municipal-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
     },
     {
       "clientId": "municipal-spa",
@@ -56,7 +135,21 @@
       ],
       "attributes": {
         "pkce.code.challenge.method": "S256"
-      }
+      },
+      "protocolMappers": [
+        {
+          "name": "municipal-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "municipal-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "users": [

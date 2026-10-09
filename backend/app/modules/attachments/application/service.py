@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from io import BytesIO
+from types import EllipsisType
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -48,6 +49,7 @@ class AttachmentService:
         entity_code: str,
         object_id: UUID,
         kind: AttachmentKind | None,
+        field_id: UUID | None,
         limit: int,
         offset: int,
     ) -> AttachmentPage:
@@ -55,6 +57,8 @@ class AttachmentService:
         conditions: list[Any] = [AttachmentModel.object_id == model.id]
         if kind is not None:
             conditions.append(AttachmentModel.kind == kind)
+        if field_id is not None:
+            conditions.append(AttachmentModel.entity_field_id == field_id)
         total = int(
             await self._session.scalar(
                 select(func.count()).select_from(AttachmentModel).where(*conditions)
@@ -83,11 +87,13 @@ class AttachmentService:
         entity_code: str,
         object_id: UUID,
         kind: AttachmentKind,
+        field_id: UUID | None,
         file: UploadFile,
         actor_id: UUID | None,
     ) -> AttachmentRead:
         schema, model = await self._object_context(entity_code, object_id, for_update=True)
         payload = await self._file_payload(file)
+        await self._validate_file_field(schema, field_id)
         self._validate_file(kind, payload["original_name"], payload["mime_type"], payload["size"])
         attachment_id = uuid4()
         object_key = f"{model.id}/{attachment_id}/v1"
@@ -96,6 +102,7 @@ class AttachmentService:
             id=attachment_id,
             entity_schema_id=schema.id,
             object_id=model.id,
+            entity_field_id=field_id,
             kind=kind,
             original_name=payload["original_name"],
             object_key=object_key,
@@ -145,6 +152,7 @@ class AttachmentService:
         attachment_id: UUID,
         original_name: str | None,
         kind: AttachmentKind | None,
+        field_id: UUID | None | EllipsisType,
     ) -> AttachmentRead:
         schema, _, attachment = await self._attachment_context(entity_code, object_id, attachment_id, for_update=True)
         if original_name is not None:
@@ -152,6 +160,9 @@ class AttachmentService:
         if kind is not None:
             self._validate_file(kind, attachment.original_name, attachment.mime_type, attachment.size_bytes)
             attachment.kind = kind
+        if field_id is not ...:
+            await self._validate_file_field(schema, field_id)
+            attachment.entity_field_id = field_id
         await self._session.commit()
         await self._session.refresh(attachment)
         return self._to_response(schema, attachment)
@@ -279,6 +290,17 @@ class AttachmentService:
             raise RuntimeObjectNotFound
         return schema, model
 
+    @staticmethod
+    async def _validate_file_field(
+        schema: EntitySchemaModel,
+        field_id: UUID | None,
+    ) -> None:
+        if field_id is None:
+            return
+        field = next((item for item in schema.fields if item.id == field_id), None)
+        if field is None or field.archived or field.field_type != "file":
+            raise AttachmentValidationError("Указанное поле не является активным file-полем сущности")
+
     async def _attachment_context(
         self,
         entity_code: str,
@@ -354,6 +376,7 @@ class AttachmentService:
             entity_id=schema.id,
             entity_code=schema.code,
             object_id=attachment.object_id,
+            field_id=attachment.entity_field_id,
             kind=attachment.kind,
             original_name=attachment.original_name,
             storage_key=attachment.object_key,

@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, false, func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import ActorContext
@@ -16,6 +16,8 @@ from app.modules.access.api.schemas import (
     PermissionAction,
     PermissionGrantCreate,
     PermissionGrantRead,
+    EffectiveCapabilitiesRead,
+    CurrentActorRead,
     SavedViewCreate,
     SavedViewRead,
     SavedViewUpdate,
@@ -319,10 +321,174 @@ class SavedViewService:
 
 
 class AuthorizationService:
-    """Проверяет гранты с учётом realm-ролей и членства в организациях."""
+    """Проверяет глобальные realm-права и предметные гранты пользователей."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def capabilities(
+        self,
+        actor: ActorContext,
+        *,
+        entity_code: str | None,
+        object_id: UUID | None,
+    ) -> EffectiveCapabilitiesRead:
+        """Вычислить разрешённые действия без раскрытия исходных грантов."""
+
+        actions: list[PermissionAction] = []
+        field_actions: dict[str, list[PermissionAction]] = {}
+        schema = None
+        if entity_code is not None:
+            schema = await self._session.scalar(
+                select(EntitySchemaModel).where(EntitySchemaModel.code == entity_code)
+            )
+            if schema is None:
+                raise AccessResourceNotFound
+            if object_id is not None:
+                exists = await self._session.scalar(
+                    select(EntityObjectModel.id).where(
+                        EntityObjectModel.id == object_id,
+                        EntityObjectModel.entity_schema_id == schema.id,
+                    )
+                )
+                if exists is None:
+                    raise AccessResourceNotFound
+        elif object_id is not None:
+            raise AccessResourceNotFound
+
+        candidate_actions: tuple[PermissionAction, ...] = (
+            "read",
+            "create",
+            "update",
+            "archive",
+            "delete",
+            "manage_schema",
+            "manage_access",
+            "export",
+            "import",
+            "request",
+            "review",
+            "confirm",
+        )
+        if schema is None:
+            actions = [
+                action
+                for action in candidate_actions
+                if f"permission_{action}" in actor.roles
+            ]
+        else:
+            for action in candidate_actions:
+                try:
+                    await self.require_entity_code(
+                        actor,
+                        action,
+                        schema.code,
+                        object_id=object_id,
+                    )
+                except AccessDenied:
+                    continue
+                actions.append(action)
+
+            for field in schema.fields:
+                if field.archived:
+                    continue
+                allowed: list[PermissionAction] = []
+                for action in actions:
+                    if action in {"create", "update"} and field.read_only:
+                        continue
+                    roles = (field.access_rules or {}).get(action)
+                    if roles is not None and not set(roles).intersection(actor.roles):
+                        continue
+                    allowed.append(action)
+                field_actions[field.code] = allowed
+
+        return EffectiveCapabilitiesRead(
+            actor=CurrentActorRead(
+                id=actor.id,
+                username=actor.username,
+                full_name=actor.display_name,
+                email=actor.email,
+                roles=sorted(actor.roles),
+            ),
+            entity_code=entity_code,
+            object_id=object_id,
+            actions=actions,
+            field_actions=field_actions,
+        )
+
+    async def readable_object_condition(
+        self,
+        actor: ActorContext,
+        *,
+        schema: EntitySchemaModel | None = None,
+    ):
+        """Вернуть SQL-условие чтения строк, эквивалентное проверке одной записи.
+
+        Условие применяется внутри исходного SELECT до count, limit и offset.
+        Для запросов сразу по нескольким сущностям ``schema`` не передаётся,
+        и вызывающий запрос должен уже содержать JOIN с ``EntitySchemaModel``.
+        """
+
+        if "permission_read" in actor.roles:
+            return true()
+
+        memberships = (
+            await self._session.scalars(
+                select(MembershipModel).where(
+                    MembershipModel.user_id == actor.id,
+                    MembershipModel.active.is_(True),
+                )
+            )
+        ).all()
+        organization_ids = {item.organization_id for item in memberships}
+        subject_roles = set(actor.roles) | {item.role_code for item in memberships}
+        grants = (
+            await self._session.scalars(
+                select(PermissionGrantModel).where(
+                    or_(
+                        PermissionGrantModel.user_id == actor.id,
+                        PermissionGrantModel.role_code.in_(subject_roles or {""}),
+                    )
+                )
+            )
+        ).all()
+
+        conditions = [EntityObjectModel.responsible_id == actor.id]
+        for grant in grants:
+            if "read" not in grant.actions:
+                continue
+            # Грант конкретного поля не разрешает чтение всей строки.
+            if grant.entity_field_id is not None:
+                continue
+            if grant.organization_id is not None and grant.organization_id not in organization_ids:
+                continue
+            if schema is not None and grant.entity_schema_id not in (None, schema.id):
+                continue
+
+            grant_conditions = []
+            if grant.entity_schema_id is not None:
+                grant_conditions.append(
+                    EntityObjectModel.entity_schema_id == grant.entity_schema_id
+                )
+            if grant.entity_object_id is not None:
+                grant_conditions.append(EntityObjectModel.id == grant.entity_object_id)
+            if grant.organization_id is not None:
+                if schema is None:
+                    effective_organization = func.coalesce(
+                        EntityObjectModel.owner_organization_id,
+                        EntitySchemaModel.owner_organization_id,
+                    )
+                elif schema.owner_organization_id is None:
+                    effective_organization = EntityObjectModel.owner_organization_id
+                else:
+                    effective_organization = func.coalesce(
+                        EntityObjectModel.owner_organization_id,
+                        schema.owner_organization_id,
+                    )
+                grant_conditions.append(effective_organization == grant.organization_id)
+            conditions.append(and_(*grant_conditions) if grant_conditions else true())
+
+        return or_(*conditions) if conditions else false()
 
     async def require(
         self,
@@ -334,6 +500,11 @@ class AuthorizationService:
         entity_field_id: UUID | None = None,
         entity_object_id: UUID | None = None,
     ) -> None:
+        # Глобальные права выдаются в Keycloak как realm-роли permission_<action>.
+        # Составные роли (например, Admin) наследуют их без особой ветки в коде.
+        if f"permission_{action}" in actor.roles:
+            return
+
         memberships = (
             await self._session.scalars(
                 select(MembershipModel).where(

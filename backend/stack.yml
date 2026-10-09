@@ -34,6 +34,7 @@ services:
       REDIS_SCHEMA_TTL_SECONDS: ${REDIS_SCHEMA_TTL_SECONDS:-3600}
       RABBITMQ_URL: ${RABBITMQ_URL:-amqp://lowcode:lowcode@rabbitmq:5672/}
       IMPORT_QUEUE_NAME: ${IMPORT_QUEUE_NAME:-object-imports}
+      EXCEL_EXPORT_QUEUE_NAME: ${EXCEL_EXPORT_QUEUE_NAME:-excel-exports}
       OUTBOX_QUEUE_NAME: ${OUTBOX_QUEUE_NAME:-platform-events}
       OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-100}
       OUTBOX_POLL_INTERVAL_SECONDS: ${OUTBOX_POLL_INTERVAL_SECONDS:-1}
@@ -43,6 +44,8 @@ services:
       EXCEL_MAX_FILE_SIZE_BYTES: ${EXCEL_MAX_FILE_SIZE_BYTES:-31457280}
       EXCEL_MAX_SHEETS: ${EXCEL_MAX_SHEETS:-20}
       EXCEL_MAX_ROWS: ${EXCEL_MAX_ROWS:-50000}
+      EXCEL_EXPORT_MAX_ROWS: ${EXCEL_EXPORT_MAX_ROWS:-500000}
+      EXCEL_EXPORT_TTL_HOURS: ${EXCEL_EXPORT_TTL_HOURS:-24}
       EXCEL_MAX_COLUMNS: ${EXCEL_MAX_COLUMNS:-200}
       EXCEL_MAX_UNCOMPRESSED_BYTES: ${EXCEL_MAX_UNCOMPRESSED_BYTES:-209715200}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
@@ -53,6 +56,7 @@ services:
       KEYCLOAK_INTERNAL_URL: ${KEYCLOAK_INTERNAL_URL:-http://keycloak:8080}
       KEYCLOAK_REALM: ${KEYCLOAK_REALM:-municipal-low-code}
       KEYCLOAK_API_CLIENT_ID: ${KEYCLOAK_API_CLIENT_ID:-municipal-api}
+      KEYCLOAK_API_AUDIENCE: ${KEYCLOAK_API_AUDIENCE:-municipal-api}
       KEYCLOAK_API_CLIENT_SECRET: ${KEYCLOAK_API_CLIENT_SECRET:-municipal-api-secret}
       KEYCLOAK_SWAGGER_CLIENT_ID: ${KEYCLOAK_SWAGGER_CLIENT_ID:-municipal-spa}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
@@ -89,7 +93,7 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=2)"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=4)"
       interval: 10s
       timeout: 3s
       retries: 5
@@ -117,6 +121,24 @@ services:
       platform:
         aliases:
           - import-worker
+
+  export-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: municipal-low-code-api:latest
+    command: ["python", "-m", "app.workers.export_worker"]
+    environment: *api-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      platform:
+        aliases:
+          - export-worker
 
   outbox-worker:
     build:

@@ -10,6 +10,7 @@ from app.modules.objects.api.schemas import GeoJsonGeometry, ValidationIssue
 
 class ChangeSetItemCreate(ApiModel):
     object_id: UUID | None = None
+    parent_object_id: UUID | None = None
     operation: Literal["create", "update", "archive", "confirm"]
     base_revision: int | None = Field(default=None, ge=1)
     values: dict[str, Any] = Field(default_factory=dict)
@@ -37,6 +38,7 @@ class ChangeSetCreate(ApiModel):
 class ChangeSetItemRead(ApiModel):
     id: UUID
     object_id: UUID | None
+    parent_object_id: UUID | None
     operation: str
     base_revision: int | None
     proposed_values: dict[str, Any]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -10,6 +11,35 @@ from app.modules.entities.api.schemas import ApiModel, to_camel
 
 ObjectValue = str | int | float | bool | list[str] | None
 DisplayValue = str | list[str] | None
+
+
+class ObjectFilterOperator(StrEnum):
+    """Поддерживаемые операции над системными и динамическими полями."""
+
+    EQUALS = "equals"
+    NOT_EQUALS = "notEquals"
+    CONTAINS = "contains"
+    STARTS_WITH = "startsWith"
+    ENDS_WITH = "endsWith"
+    GREATER_THAN = "greaterThan"
+    GREATER_OR_EQUAL = "greaterOrEqual"
+    LESS_THAN = "lessThan"
+    LESS_OR_EQUAL = "lessOrEqual"
+    IN = "in"
+    NOT_IN = "notIn"
+    FILLED = "filled"
+    EMPTY = "empty"
+    TODAY = "today"
+    BEFORE_TODAY = "beforeToday"
+    AFTER_TODAY = "afterToday"
+
+
+class ObjectStatusScope(StrEnum):
+    """Набор состояний объектов, включаемых в выборку."""
+
+    CURRENT = "current"
+    ARCHIVED = "archived"
+    ALL = "all"
 
 
 class GeoJsonGeometry(ApiModel):
@@ -140,7 +170,7 @@ class EntityObjectPatch(ApiModel):
                 "для защиты от потери изменений"
             ),
         ),
-    ] | None = None
+    ]
 
     @model_validator(mode="after")
     def require_change(self) -> "EntityObjectPatch":
@@ -158,27 +188,14 @@ class ObjectFilter(ApiModel):
 
     field: str = Field(
         min_length=1,
-        max_length=120,
-        description="Код динамического или системного поля",
+        max_length=241,
+        description=(
+            "Код динамического или системного поля. Для родителя: "
+            "parent.<кодПоля>; для reference-поля: "
+            "<кодReferenceПоля>.<кодПоляСвязаннойСущности>"
+        ),
     )
-    operator: Literal[
-        "equals",
-        "notEquals",
-        "contains",
-        "startsWith",
-        "endsWith",
-        "greaterThan",
-        "greaterOrEqual",
-        "lessThan",
-        "lessOrEqual",
-        "in",
-        "notIn",
-        "filled",
-        "empty",
-        "today",
-        "beforeToday",
-        "afterToday",
-    ] = Field(description="Оператор сравнения")
+    operator: ObjectFilterOperator = Field(description="Оператор сравнения")
     value: str | None = Field(default=None, description="Значение для сравнения")
 
 
@@ -186,11 +203,23 @@ class ObjectSearch(ApiModel):
     """Параметры расширенного поиска объектов."""
 
     logic: Literal["and", "or"] = Field(default="and", description="Логика объединения условий")
+    q: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=300,
+        description="Полнотекстовый поиск по полям с searchable=true",
+    )
+    status: ObjectStatusScope = Field(
+        default=ObjectStatusScope.CURRENT,
+        description="Текущие, архивные или все доступные объекты",
+    )
     filters: list[ObjectFilter] = Field(
         default_factory=list,
         max_length=50,
         description="Условия фильтрации",
     )
+    object_ids: list[UUID] = Field(default_factory=list, max_length=5000)
+    excluded_ids: list[UUID] = Field(default_factory=list, max_length=5000)
     sort: str | None = Field(
         default=None,
         max_length=130,
@@ -211,6 +240,93 @@ class ObjectSearch(ApiModel):
         description="Количество объектов на странице",
     )
     offset: int = Field(default=0, ge=0, description="Смещение от начала выборки")
+
+
+class RegistryProjection(ApiModel):
+    """Колонки, фильтры и сортировка одной сущности в составной выборке."""
+
+    columns: list[str] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Коды выдаваемых полей; пустой список означает поля listVisible",
+    )
+    q: str | None = Field(default=None, min_length=1, max_length=300)
+    status: ObjectStatusScope = ObjectStatusScope.CURRENT
+    logic: Literal["and", "or"] = Field(default="and", description="Логика фильтров")
+    filters: list[ObjectFilter] = Field(default_factory=list, max_length=50)
+    sort: str | None = Field(default=None, max_length=130)
+    selection_mode: Literal["filter", "ids"] = "filter"
+    object_ids: list[UUID] = Field(default_factory=list, max_length=5000)
+    excluded_ids: list[UUID] = Field(default_factory=list, max_length=5000)
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> "RegistryProjection":
+        if self.selection_mode == "ids" and not self.object_ids:
+            raise ValueError("Для selectionMode=ids необходимо передать objectIds")
+        if self.selection_mode == "ids" and self.excluded_ids:
+            raise ValueError("excludedIds применим только к selectionMode=filter")
+        return self
+
+
+class ChildRegistryProjection(RegistryProjection):
+    """Подреестр, присоединяемый через parentObjectId."""
+
+    entity_code: str = Field(min_length=1, max_length=120)
+    limit_per_parent: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Максимум дочерних объектов на одну запись родителя",
+    )
+
+
+class RegistryTreeSearch(RegistryProjection):
+    """Проекция реестра вместе с его непосредственными подреестрами."""
+
+    children: list[ChildRegistryProjection] = Field(default_factory=list, max_length=10)
+    parent_object_id: UUID | None = None
+    bbox: tuple[float, float, float, float] | None = None
+    limit: int = Field(default=100, ge=1, le=1000)
+    offset: int = Field(default=0, ge=0)
+
+
+class ProjectedObjectRead(ApiModel):
+    """Объект с выбранными колонками и сгруппированными подреестрами."""
+
+    id: UUID
+    parent_object_id: UUID | None
+    status: str
+    data_quality: str
+    values: dict[str, ObjectValue]
+    display_values: dict[str, DisplayValue] = Field(default_factory=dict)
+    children: dict[str, list[ProjectedObjectRead]] = Field(default_factory=dict)
+
+
+class RegistryTreePage(ApiModel):
+    """Страница составной выборки без размножения родительских строк."""
+
+    total: int
+    returned: int
+    offset: int
+    limit: int
+    data: list[ProjectedObjectRead]
+
+
+class GeneratedApiKeyRead(ApiModel):
+    """Ключ read-only API; значение доступно только администратору."""
+
+    entity_id: UUID
+    entity_code: str
+    client_id: str
+    api_key: str = Field(
+        description="Полное значение заголовка X-API-Key. Не сохранять во frontend-коде."
+    )
+    header_name: Literal["X-API-Key"] = "X-API-Key"
+
+
+class GeneratedApiKeyDeleteRead(ApiModel):
+    entity_id: UUID
+    deleted: bool = True
 
 
 class ValidationIssue(ApiModel):
@@ -278,6 +394,18 @@ class ObjectClusterPage(ApiModel):
     total_objects: int
 
 
+class ObjectClusterSearch(ApiModel):
+    """Единые параметры кластеризации и табличной фильтрации."""
+
+    bbox: tuple[float, float, float, float]
+    zoom: int = Field(ge=0, le=24)
+    q: str | None = Field(default=None, min_length=1, max_length=300)
+    status: ObjectStatusScope = ObjectStatusScope.CURRENT
+    parent_object_id: UUID | None = None
+    logic: Literal["and", "or"] = "and"
+    filters: list[ObjectFilter] = Field(default_factory=list, max_length=50)
+
+
 class EntityObjectBulkCreateRead(ApiModel):
     """Результат массового создания объектов одной сущности."""
 
@@ -299,6 +427,13 @@ class ObjectImportJobRead(ApiModel):
     error_rows: int
     created_at: datetime
     updated_at: datetime
+
+
+class ObjectImportJobPage(ApiModel):
+    items: list[ObjectImportJobRead]
+    total: int
+    limit: int
+    offset: int
 
 
 class ObjectImportJobCommand(ApiModel):

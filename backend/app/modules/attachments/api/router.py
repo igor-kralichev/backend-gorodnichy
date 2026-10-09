@@ -47,6 +47,7 @@ async def list_object_attachments(
     actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
     kind: AttachmentKind | None = Query(default=None, description="Фильтр по типу файла"),
+    field_id: Annotated[UUID | None, Query(alias="fieldId", description="Фильтр по file-полю")] = None,
     limit: int = Query(default=50, ge=1, le=500, description="Количество файлов на странице"),
     offset: int = Query(default=0, ge=0, description="Смещение от начала списка"),
 ) -> AttachmentPage:
@@ -56,6 +57,7 @@ async def list_object_attachments(
             entity_code=entity_code,
             object_id=object_id,
             kind=kind,
+            field_id=field_id,
             limit=limit,
             offset=offset,
         )
@@ -76,6 +78,7 @@ async def upload_object_attachment(
     actor: CurrentActor,
     session: Annotated[AsyncSession, Depends(get_session)],
     kind: AttachmentKind = Query(description="Тип файла: photo или document"),
+    field_id: Annotated[UUID | None, Query(alias="fieldId", description="UUID поля типа file")] = None,
     file: UploadFile = File(description="PDF, DOC, DOCX или изображение"),
 ) -> AttachmentRead:
     await _authorize(session, actor, "update", entity_code, object_id)
@@ -84,6 +87,7 @@ async def upload_object_attachment(
             entity_code=entity_code,
             object_id=object_id,
             kind=kind,
+            field_id=field_id,
             file=file,
             actor_id=actor.id,
         )
@@ -234,6 +238,7 @@ async def update_object_attachment(
             attachment_id=attachment_id,
             original_name=payload.original_name,
             kind=payload.kind,
+            field_id=payload.field_id if "field_id" in payload.model_fields_set else ...,
         )
     )
     await AuditService(session).record(
