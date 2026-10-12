@@ -338,6 +338,11 @@ class EntitySchemaManagementService:
             entity.current_version += 1
             if entity.status == EntityStatus.ACTIVE.value:
                 self._sync_layer(entity)
+            await self._session.flush()
+            # updated_at обновляется PostgreSQL через onupdate. После flush
+            # SQLAlchemy помечает значение устаревшим; явный refresh не даёт
+            # snapshot() инициировать запрещённый неявный async I/O.
+            await self._session.refresh(entity, attribute_names=["updated_at"])
             self._session.add(
                 EntitySchemaVersionModel(
                     entity_schema_id=entity.id,
@@ -354,6 +359,7 @@ class EntitySchemaManagementService:
                 {"previousVersion": previous_version},
             )
             await self._session.flush()
+            await self._session.refresh(entity, attribute_names=["updated_at"])
             entity_id = entity.id
             response = self._builder.to_response(entity)
         await self._invalidate_cache(entity_id, expected_version)

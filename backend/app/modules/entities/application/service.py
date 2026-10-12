@@ -420,6 +420,8 @@ class CreateEntitySchemaService:
                     archived=field.archived,
                     access=field.access_rules,
                     formula=field.formula,
+                    unit_code=field.unit_code,
+                    decimal_scale=field.decimal_scale,
                 )
                 for field in sorted(entity.fields, key=lambda item: item.sort_order)
             ],

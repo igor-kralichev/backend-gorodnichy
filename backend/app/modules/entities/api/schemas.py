@@ -561,6 +561,8 @@ class EntityFieldRead(ApiModel):
     archived: bool = False
     access: dict[str, list[str]] = Field(default_factory=dict)
     formula: dict[str, Any] | None = None
+    unit_code: str | None = None
+    decimal_scale: int | None = None
 
 
 class MapColorRuleRead(MapColorRuleCreate):

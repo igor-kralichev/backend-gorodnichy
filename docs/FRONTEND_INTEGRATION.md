@@ -123,7 +123,7 @@ WebSocket импорта открывается с актуальным access t
 4. `POST /api/v1/entities/{identifier}/publish` переводит схему в `active` и создаёт/синхронизирует слой карты.
 5. После публикации перечитайте `GET /api/v1/generated/catalog/{entityCode}`.
 
-Поддерживаются поля `string`, `text`, `integer`, `decimal`, `boolean`, `date`, `datetime`, `address`, `enum`, `reference`, `file`, `phone`, `email`, `url`, `calculated`. Для вычисляемого поля формула обязательна, а значение доступно только для чтения.
+Поддерживаются поля `string`, `text`, `integer`, `decimal`, `boolean`, `date`, `datetime`, `address`, `enum`, `reference`, `file`, `phone`, `email`, `url`, `calculated`. Для вычисляемого поля формула обязательна, а значение доступно только для чтения. Для числовых полей backend возвращает те же `unitCode` и `decimalScale`, которые были переданы при создании или изменении схемы; frontend может без потерь переоткрывать редактор сущности и её черновик.
 
 Операции: список/создание — `/entities`; чтение, изменение и полное удаление — `/entities/{identifier}`; действия — `/archive`, `/restore`, `/duplicate`, `/publish`. Восстановленная сущность становится черновиком и требует повторной публикации. Копия получает новый id/code, статус `draft`, схему и настройки, но не объекты.
 

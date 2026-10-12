@@ -64,7 +64,7 @@ Realm role `Admin` в Keycloak является составной ролью и
 
 ## Сущности и справочники
 
-`POST /api/v1/entities` создаёт черновик, поля и версию схемы атомарно. Поля поддерживают `string`, `text`, `integer`, `decimal`, `boolean`, `date`, `datetime`, `address`, `enum`, `reference`, `file`, `phone`, `email`, `url`, `calculated`. Для `enum` обязателен существующий `enumId`, для `reference` — `referenceEntityId`, для `calculated` — формула.
+`POST /api/v1/entities` создаёт черновик, поля и версию схемы атомарно. Поля поддерживают `string`, `text`, `integer`, `decimal`, `boolean`, `date`, `datetime`, `address`, `enum`, `reference`, `file`, `phone`, `email`, `url`, `calculated`. Для `enum` обязателен существующий `enumId`, для `reference` — `referenceEntityId`, для `calculated` — формула. Числовые метаданные `unitCode` и `decimalScale` сохраняются в схеме, версиях и возвращаются во всех ответах чтения сущности.
 
 Код генерируется из названия; при совпадении автоматически добавляется `_2`, `_3` и т. д. Явно переданный занятый код возвращает `409`. `includeAddress=true` добавляет системное адресное поле. `parentEntityId` задаёт универсальную вложенность схем.
 
